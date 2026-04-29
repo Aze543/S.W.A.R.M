@@ -1,0 +1,52 @@
+import { Tabs } from "expo-router";
+import { Ionicons } from "@expo/vector-icons";
+
+export default function _Layout() {
+  return (
+    <Tabs
+      screenOptions={{
+        headerShown: false,
+
+        tabBarStyle: {
+          backgroundColor: "#0f172a",
+          borderTopColor: "#1e293b"
+        },
+
+        tabBarActiveTintColor: "#3b82f6",
+        tabBarInactiveTintColor: "#94a3b8"
+      }}
+    >
+
+      <Tabs.Screen
+        name="index"
+        options={{
+          title: "Live Monitoring",
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="pulse" size={size} color={color} />
+          )
+        }}
+      />
+
+      <Tabs.Screen
+        name="mapview"
+        options={{
+          title: "Map View",
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="map" size={size} color={color} />
+          )
+        }}
+      />
+
+      <Tabs.Screen
+        name="controlpanel"
+        options={{
+          title: "Control Panel",
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="game-controller" size={size} color={color} />
+          )
+        }}
+      />
+
+    </Tabs>
+  );
+}
