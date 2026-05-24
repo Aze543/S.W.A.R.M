@@ -43,7 +43,7 @@ def _reader():
                                             "lat": round(sum(lats)/len(lats), 6),
                                             "lng": round(sum(lngs)/len(lngs), 6)
                                         }
-                                    readings = []  # reset, keep updating
+                                    readings = []
                                 else:
                                     readings.pop(0)
                     except Exception:

@@ -1,5 +1,5 @@
-import { Tabs } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { Tabs } from "expo-router";
 
 export default function _Layout() {
   return (
@@ -42,10 +42,21 @@ export default function _Layout() {
         options={{
           title: "Control Panel",
           tabBarIcon: ({ color, size }) => (
+            <Ionicons name="navigate-circle" size={size} color={color} />
+          )
+        }}
+      />
+
+      <Tabs.Screen
+        name="controller"
+        options={{
+          title: "Controller",
+          tabBarIcon: ({ color, size }) => (
             <Ionicons name="game-controller" size={size} color={color} />
           )
         }}
       />
+
 
     </Tabs>
   );
