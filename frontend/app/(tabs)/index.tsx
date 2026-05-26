@@ -1,19 +1,3 @@
-/**
- * index.tsx — Live Monitoring
- *
- * Fixes vs the submitted version
- * ────────────────────────────────
- * FIX-A  trash_count does NOT exist in /live-monitoring.
- *        It lives at GET http://LAPTOP:5001/data → { total, detections, action }.
- *        Added DATA_URL + VisionData type. Fetched separately so laptop
- *        being offline doesn't abort the Pi telemetry fetch.
- *
- * FIX-B  total_capacity is raw plastic + non_plastic (range 42–90), not a %.
- *        Normalized to 0–100 via (value / MAX_BIN) * 100 before display.
- *
- * FIX-D  fetchAll wrapped in useCallback for consistency and future-proofing.
- */
-
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Text, View } from "react-native";
@@ -27,13 +11,10 @@ const POLL_INTERVAL = Number(process.env.EXPO_PUBLIC_POLL_INTERVAL ?? 1000);
 
 const API_URL     = `${PI_URL}/live-monitoring`;
 const MISSION_URL = `${PI_URL}/mission/status`;
-// FIX-A: trash count lives on the laptop ground-control server, not the Pi
 const DATA_URL    = `${LAPTOP_IP}:5001/data`;
 
-// FIX-B: plastic + non_plastic both max at 45, so full bin = 90
 const MAX_BIN = 90;
 
-// Only update GPS heading when ASV has moved at least this far (metres)
 const MIN_MOVE_M = 1.5;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -46,7 +27,7 @@ type MonitoringData = {
   longitude:      number;
 };
 
-// FIX-A: separate type for the laptop's /data endpoint
+
 type VisionData = {
   total:      number;   // pieces counted by YOLO crossing the line
   detections: string[];

@@ -1,30 +1,3 @@
-/**
- * controlpanel.tsx
- *
- * Owns: battery, GPS position, speed, GPS-derived heading, orientation (pitch/roll).
- *
- * What was removed vs. the original
- * ──────────────────────────────────
- * • Mode toggle — controller.tsx owns the mode + calls POST /mode on the server.
- *   A second toggle here was pure local state that did nothing on the server.
- * • Emergency Stop button — had no onPress handler at all. controller.tsx owns
- *   E-STOP correctly with the repeat-stop + fireCommand logic.
- * • System Logs — all three lines showed the same timestamp on every poll,
- *   making them fake and misleading. Replaced with real status chips.
- *
- * What was fixed
- * ──────────────
- * • ControlPanelData now includes `battery` (API returns it, type ignored it).
- * • getOrientationStatus thresholds fixed: MPU6050 pitch is capped at ±90°,
- *   so the old `> 90` FLIPPED check was unreachable. Now uses > 70 / > 40.
- * • GPS-derived heading: bearing is computed from the previous GPS position to
- *   the current one. Only updates when the ASV has moved > 1.5 m to avoid
- *   noisy flicker at standstill. Shows "---" until first movement detected.
- * • Speed bar uses percentage width (not flex ratio) for correct rendering.
- * • Server mode is read from GET /mode so this screen always reflects the real
- *   server state, not a stale local assumption.
- */
-
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";

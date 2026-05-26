@@ -1,30 +1,3 @@
-/**
- * mapview.tsx
- *
- * Shows: vessel live position, vessel trail, trash detection markers,
- *        active mission waypoints, PiP AI camera stream.
- *
- * Fixes vs original
- * ─────────────────
- * FIX-1  fetchData wrapped in useCallback — was recreated every render,
- *        causing the poll interval to restart constantly (stale closure).
- * FIX-2  useEffect dep array is now [fetchData] not [animateTo].
- * FIX-3  MONITOR_API uses env var properly (hardcoded IP was a workaround).
- * FIX-4  MapTiler key moved to EXPO_PUBLIC_MAPTILER_KEY env var.
- * FIX-5  WebView shows loading / error states instead of silent black box.
- * FIX-6  animateTo only fires when vessel moves > 2 m (stops fighting manual zoom).
- *
- * Visual improvements
- * ───────────────────
- * • Trash markers are numbered in detection order so you can see the sequence.
- * • Mission waypoints fetched from /mission/status and shown as numbered blue
- *   squares — current target highlighted, completed ones dimmed.
- * • Vessel trail (Polyline) is the grey historical path.
- *   Mission waypoint connector is a separate blue dashed line.
- * • Vessel marker shows a direction arrow derived from the last two GPS positions.
- * • PiP overlay shows CONNECTING / OFFLINE states when stream is down.
- */
-
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";

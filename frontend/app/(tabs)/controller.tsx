@@ -1,34 +1,3 @@
-/**
- * controller.tsx
- *
- * Owns: mode switch (manual / autonomous), motor commands, E-STOP,
- *       return-to-home.
- * Locked to landscape.
- *
- * HOW THE MODE GATE WORKS
- * ───────────────────────
- * The ground-control laptop sends POST /control { command:"AUTO", ... }
- * every 500 ms regardless of what the phone is doing. Without a server-side
- * gate, switching to manual on the phone doesn't stop the ASV from reacting
- * to those packets.
- *
- * Fix: the Pi exposes POST /mode { mode: "manual" | "autonomous" }.
- * The phone calls that on every toggle. The Pi then:
- *   • manual     → /debug-command executes, /control AUTO packets are dropped
- *   • autonomous → /control AUTO packets execute, /debug-command is dropped
- *
- * RETURN TO HOME
- * ──────────────
- * Calls POST /return-home on the Pi. The Pi sets MissionManager to RETURNING
- * state which navigates back to the GPS coordinates saved when the last survey
- * was started. Only available in AUTONOMOUS mode (in manual you drive yourself).
- * Disabled if no survey has ever been started (no home position saved on Pi).
- *
- * BUG FIXED
- * ─────────
- * Original had /phone-command instead of /debug-command in fireCommand.
- */
-
 import { useFocusEffect } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { StatusBar } from "expo-status-bar";
