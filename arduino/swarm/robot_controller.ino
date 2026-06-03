@@ -290,7 +290,7 @@ void loop() {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       commandBuffer.trim();
-      if (commandBuffer.length() > 0) {
+      if (!commandBuffer.isEmpty()) {
         String cmd = commandBuffer;
         commandBuffer = "";
         if (cmd == "START_SENSOR") {

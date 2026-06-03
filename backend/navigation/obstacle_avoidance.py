@@ -1,32 +1,52 @@
-from typing import Optional
+from typing import Optional, Dict
+import logging
 
-def check_for_obstacles(distance_reading: float, threshold: float = 1.5) -> bool:
+logger = logging.getLogger(__name__)
+
+# Minimum absolute clearance (in cm) required to actually steer into a path
+MIN_SAFE_CLEARANCE_CM = 50.0
+
+def check_for_obstacles(distance_reading_m: float, threshold: float ) -> bool:
     """
-    Returns True if an obstacle is within `threshold` metres.
+    Returns True if an obstacle is within the threshold or if the sensor fails.
 
-    distance_reading : sensor reading in METRES (caller must convert from cm)
-    threshold        : metres — mission_manager uses 0.40 m
+    distance_reading_m : sensor reading in METRES.
+    threshold_m        : safety margin in METRES (default matches mission_manager).
     """
-    if distance_reading <= 0:
-        # 0 or negative = sensor error / out-of-range, treat as clear
-        return False
-    return distance_reading < threshold
+    # FAIL-SAFE: 0 or negative indicates a sensor timeout or dead-zone collision risk.
+    if distance_reading_m <= 0:
+        logger.warning("[OBSTACLE] Sensor error or dead-zone detected (<= 0m)! Triggering fail-safe.")
+        return True
+
+    return distance_reading_m < threshold
 
 
-def find_clear_path(scan_data: Optional[dict] = None) -> int:
+def find_clear_path(sensor_data_cm: Optional[Dict[str, int]] = None) -> str:
     """
-    Returns the angle (degrees) with the most clearance.
+    Evaluates Left and Right clearances and returns a valid directional string
+    command ('LEFT', 'RIGHT', or 'STOP') to guide the vessel away from trouble.
 
-    scan_data : {angle_deg: sensor_value} — values are compared relatively,
-                so cm and metres both work correctly for gap-finding.
+    sensor_data_cm : Expected dict format matching server.py:
+                     {"front": int, "left": int, "right": int}
     """
-    if not scan_data:
-        print("[OBSTACLE_AVOIDANCE] No scan data — defaulting to 45° safety turn.")
-        return 45
+    if not sensor_data_cm:
+        logger.warning("[AVOIDANCE] No sensor data available! Defaulting to emergency safety turn.")
+        return "LEFT"
 
-    best_angle    = max(scan_data, key=scan_data.get)
-    max_clearance = scan_data[best_angle]
+    left_clearance  = sensor_data_cm.get("left", 0)
+    right_clearance = sensor_data_cm.get("right", 0)
 
-    # Values from mission_manager are in cm (raw Arduino readings)
-    print(f"[OBSTACLE_AVOIDANCE] Best gap at {best_angle}° with {max_clearance} cm clearance.")
-    return best_angle
+    logger.debug("[AVOIDANCE] Evaluating escape paths -> Left: %d cm, Right: %d cm", left_clearance, right_clearance)
+
+    # If both paths are blocked below our absolute physical limit, we must stop.
+    if left_clearance < MIN_SAFE_CLEARANCE_CM and right_clearance < MIN_SAFE_CLEARANCE_CM:
+        logger.error("[AVOIDANCE] All paths completely blocked! Commanding emergency STOP.")
+        return "STOP"
+
+    # Choose the side with the maximum clearance
+    if left_clearance >= right_clearance:
+        logger.info("[AVOIDANCE] Clear path found. Evading LEFT (Clearance: %d cm)", left_clearance)
+        return "LEFT"
+    else:
+        logger.info("[AVOIDANCE] Clear path found. Evading RIGHT (Clearance: %d cm)", right_clearance)
+        return "RIGHT"

@@ -1,7 +1,11 @@
 import serial
 import threading
 import time
-from typing import Optional
+from typing import Optional, Dict, Any
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 SERIAL_PORT = '/dev/ttyACM0'
 BAUD_RATE   = 115200
@@ -19,10 +23,12 @@ _COMMAND_MAP: dict = {
     "AVOID_RIGHT": "RIGHT",
 }
 
-# Commands that bypass the motor map and are sent verbatim to the Arduino.
+# Commands sent verbatim — bypass motor map entirely.
 _PASSTHROUGH_COMMANDS: set = {
     "START_SENSOR",
     "STOP_SENSOR",
+    "OPEN_BASKET",    # ← new
+    "CLOSE_BASKET",   # ← new
 }
 
 _data:      Optional[dict]          = None
@@ -30,11 +36,9 @@ _ser:       Optional[serial.Serial] = None
 _data_lock  = threading.Lock()
 _ser_lock   = threading.Lock()
 
-# ── Ready event ───────────────────────────────────────────────────────────────
-# Set by the reader thread the moment it sees "Setup done" from the Arduino.
-# server.py waits on this before sending START_SENSOR so the command is never
-# sent into the void while the Arduino is still arming its ESCs.
-ready_event = threading.Event()
+# ── Ready / sensor-active events ──────────────────────────────────────────────
+ready_event   = threading.Event()
+sensor_active = False   # True after ACK START_SENSOR received
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,41 +51,50 @@ def get_arduino() -> Optional[dict]:
 def send_command(command: str) -> bool:
     cmd_upper = command.upper()
 
-    # Passthrough — lifecycle signals sent verbatim
     if cmd_upper in _PASSTHROUGH_COMMANDS:
         raw = cmd_upper
     else:
         raw = _COMMAND_MAP.get(cmd_upper)
         if raw is None:
-            print(f"[ARDUINO] Unknown command '{command}' — ignored")
+            logger.warning("[ARDUINO] Unknown command '%s' — ignored", command)
             return False
 
     with _ser_lock:
         if _ser is None or not _ser.is_open:
-            print(f"[ARDUINO] Cannot send '{raw}' — serial not ready")
+            logger.error("[ARDUINO] Cannot send '%s' — serial not ready", raw)
             return False
         try:
+            _ser.reset_output_buffer()
             _ser.write(f"{raw}\n".encode("utf-8"))
-            print(f"[ARDUINO] Sent: {raw}  (from intent: {command})")
+            _ser.flush()
+            logger.info("[ARDUINO] Sent: %s  (from intent: %s)", raw, command)
             return True
         except serial.SerialException as e:
-            print(f"[ARDUINO] Send failed: {e}")
+            logger.error("[ARDUINO] Send failed: %s", e)
             return False
+
+
+def send_command_with_retry(command: str, retries: int = 3, delay: float = 1.0) -> bool:
+    for attempt in range(1, retries + 1):
+        if send_command(command):
+            return True
+        logger.warning("[ARDUINO] '%s' failed (attempt %d/%d), retrying in %.1fs…", command, attempt, retries, delay)
+        time.sleep(delay)
+    logger.error("[ARDUINO] WARNING — '%s' could not be sent after %d attempts", command, retries)
+    return False
 
 
 def wait_until_ready(timeout: float = 30.0) -> bool:
-    """
-    Block until the Arduino has finished its setup() routine, or until
-    `timeout` seconds pass.  Returns True if ready, False if timed out.
-
-    Call this from server.py before sending START_SENSOR:
-
-        arduino.start()
-        if not arduino.wait_until_ready(timeout=30):
-            print("[APP] WARNING — Arduino did not signal ready in time")
-        arduino.send_command("START_SENSOR")
-    """
     return ready_event.wait(timeout=timeout)
+
+
+def wait_until_sensor_active(timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if sensor_active:
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def start() -> None:
@@ -92,7 +105,8 @@ def start() -> None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EXPECTED_FIELDS = 7
+# 8 fields now: roll, pitch, left, front, right, battery%, motor_state, basket_state
+_EXPECTED_FIELDS = 8
 
 
 def _parse(line: str) -> Optional[dict]:
@@ -108,6 +122,7 @@ def _parse(line: str) -> Optional[dict]:
             "right_distance":  int(parts[4]),
             "battery_percent": float(parts[5]),
             "motor_state":     parts[6].strip(),
+            "basket_state":    parts[7].strip(),   # ← new
         }
     except ValueError as e:
         print(f"[ARDUINO] Parse error: {e} | line: {line!r}")
@@ -121,6 +136,7 @@ def _open_serial() -> serial.Serial:
             print(f"[ARDUINO] Connecting to {SERIAL_PORT}...")
             ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
             ser.reset_input_buffer()
+            ser.reset_output_buffer()
             print("[ARDUINO] Connected")
             return ser
         except serial.SerialException as e:
@@ -130,7 +146,7 @@ def _open_serial() -> serial.Serial:
 
 
 def _reader() -> None:
-    global _data, _ser
+    global _data, _ser, sensor_active
 
     while True:
         ser = _open_serial()
@@ -138,9 +154,8 @@ def _reader() -> None:
         with _ser_lock:
             _ser = ser
 
-        # Each reconnect resets the ready flag so START_SENSOR is re-sent
-        # if the server restarts or the Arduino is power-cycled mid-session.
         ready_event.clear()
+        sensor_active = False
 
         try:
             while True:
@@ -149,23 +164,23 @@ def _reader() -> None:
                 if not raw:
                     continue
 
-                # ── Arduino ready signal ──────────────────────────────────
-                # "Setup done" is the last line printed by the Arduino's
-                # setup() function, after the 3-second ESC arming delay.
-                # Only set the event once per connection so a reconnect
-                # forces server.py to re-wait (handled by clear() above).
-                if "Setup done" in raw:
-                    print("[ARDUINO] Ready signal received — Arduino is up")
+                if "setup done" in raw.lower():
+                    print(f"[ARDUINO] Ready signal received: '{raw}'")
                     ready_event.set()
                     continue
 
-                # ── ACK lines ─────────────────────────────────────────────
                 if raw.startswith("ACK "):
                     print(f"[ARDUINO] {raw}")
+                    if "START_SENSOR" in raw:
+                        sensor_active = True
+                        print("[ARDUINO] Sensor gate OPEN — motor & basket commands honoured")
+                    elif "STOP_SENSOR" in raw:
+                        sensor_active = False
+                        print("[ARDUINO] Sensor gate CLOSED")
                     continue
 
-                # ── Skip non-CSV lines (boot messages, [CMD] prints, etc.) ──
                 if ',' not in raw:
+                    print(f"[ARDUINO] <info> {raw}")
                     continue
 
                 parsed = _parse(raw)
@@ -175,6 +190,7 @@ def _reader() -> None:
 
         except serial.SerialException as e:
             print(f"[ARDUINO] Connection lost: {e}")
+            sensor_active = False
         finally:
             with _ser_lock:
                 try:

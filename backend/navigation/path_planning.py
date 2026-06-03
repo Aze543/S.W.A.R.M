@@ -1,5 +1,9 @@
 import math
+import logging
+from typing import List, Tuple
 
+# Set up a module‑level logger
+logger = logging.getLogger(__name__)
 
 class PathPlanner:
     def __init__(self, earth_radius: float = 6_371_000):
@@ -15,7 +19,7 @@ class PathPlanner:
         lon: float,
         distance: float,
         bearing: float = 0,
-    ) -> tuple[float, float]:
+    ) -> Tuple[float, float]:
         """
         Returns the (lat, lon) that is `distance` metres from (lat, lon)
         in the direction `bearing` (degrees, clockwise from north).
@@ -36,7 +40,7 @@ class PathPlanner:
         return math.degrees(lat2), math.degrees(lon2)
 
     # ------------------------------------------------------------------ #
-    # Lawnmower / boustrophedon survey path                               #
+    # Lawnmower / boustrophedon survey path                              #
     # ------------------------------------------------------------------ #
 
     def generate_survey_path(
@@ -47,76 +51,58 @@ class PathPlanner:
         strip_length:    float = 15.0,
         strip_spacing:   float = 3.0,
         num_strips:      int   = 4,
-    ) -> list[tuple[float, float]]:
+    ) -> List[Tuple[float, float]]:
         """
         Generates a boustrophedon (lawnmower) path for river survey.
-
-        Returns a list of (lat, lon) waypoints.  The MissionManager
-        navigates through them in order, reacting to trash along the way.
-
-        Sensible defaults for a small river test:
-          strip_length=15m, strip_spacing=3m, num_strips=4
-          → covers a 15 m × 9 m area (4 strips, 3 m apart)
-
-        For a wider river, increase strip_length.
-        For denser coverage, decrease strip_spacing.
-        For more area, increase num_strips.
+        Returns a list of (lat, lon) waypoints.
         """
-        waypoints: list[tuple[float, float]] = []
+        waypoints: List[Tuple[float, float]] = []
 
-        # Step direction is 90° clockwise from the sweep bearing
-        # (i.e. "downstream" when initial_bearing points across the river)
+        # Pre‑compute the downstream step bearing (90° clockwise)
         step_bearing = (initial_bearing + 90) % 360
 
-        cur_lat = start_lat
-        cur_lon = start_lon
+        cur_lat, cur_lon = start_lat, start_lon
 
         for strip in range(num_strips):
-            # Alternate sweep direction each strip (boustrophedon)
-            if strip % 2 == 0:
-                sweep_bearing = initial_bearing                  # e.g. east
-            else:
-                sweep_bearing = (initial_bearing + 180) % 360   # e.g. west
+            # Alternate sweep direction each strip
+            sweep_bearing = initial_bearing if strip % 2 == 0 else (initial_bearing + 180) % 360
 
-            # End of this strip
-            end_lat, end_lon = self.get_next_waypoint(
-                cur_lat, cur_lon, strip_length, sweep_bearing
-            )
+            # Compute the endpoint of the current strip
+            end_lat, end_lon = self.get_next_waypoint(cur_lat, cur_lon, strip_length, sweep_bearing)
             waypoints.append((end_lat, end_lon))
 
-            # Step downstream to start of next strip (skip after last strip)
+            # Step downstream to start the next strip (if not the final strip)
             if strip < num_strips - 1:
-                step_lat, step_lon = self.get_next_waypoint(
-                    end_lat, end_lon, strip_spacing, step_bearing
-                )
+                step_lat, step_lon = self.get_next_waypoint(end_lat, end_lon, strip_spacing, step_bearing)
                 waypoints.append((step_lat, step_lon))
                 cur_lat, cur_lon = step_lat, step_lon
             else:
                 cur_lat, cur_lon = end_lat, end_lon
 
-        total_strips   = num_strips
-        total_waypoints = len(waypoints)
-        area_m2        = strip_length * (strip_spacing * (num_strips - 1))
-        print(
-            f"[PATH_PLANNER] Generated {total_waypoints} waypoints — "
-            f"{total_strips} strips × {strip_length}m, "
-            f"{strip_spacing}m spacing, ~{area_m2:.0f}m² coverage"
+        area_m2 = strip_length * (strip_spacing * (num_strips - 1))
+        logger.info(
+            "[PATH_PLANNER] Generated %d waypoints — %d strips × %.1f m, "
+            "%.1f m spacing, ~%d m² coverage",
+            len(waypoints),
+            num_strips,
+            strip_length,
+            strip_spacing,
+            int(area_m2),
         )
+
         return waypoints
 
     # ------------------------------------------------------------------ #
-    # Return-to-home path                                                  #
+    # Return-to-home path                                                #
     # ------------------------------------------------------------------ #
 
     def generate_return_path(
         self,
         home_lat: float,
         home_lon: float,
-    ) -> list[tuple[float, float]]:
+    ) -> List[Tuple[float, float]]:
         """
         Returns a single-waypoint path pointing at the home position.
-        The MissionManager's existing waypoint navigation logic handles
-        steering — no special geometry needed here.
         """
-        print(f"[PATH_PLANNER] Return-to-home path → ({home_lat:.6f}, {home_lon:.6f})")
+        logger.info("[PATH_PLANNER] Return-to-home path → (%.6f, %.6f)", home_lat, home_lon)
         return [(home_lat, home_lon)]

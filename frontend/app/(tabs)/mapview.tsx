@@ -6,77 +6,85 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 
 // ─── Configuration ────────────────────────────────────────────────────────────
+const GROUND_CONTROL_URL =
+  process.env.EXPO_PUBLIC_GROUND_CONTROL_URL ?? "http://192.168.1.100:5001";
+const MAPTILER_KEY =
+  process.env.EXPO_PUBLIC_MAPTILER_KEY ?? "skibidigyaatnerizzler67rokunana";
+const PI_URL = process.env.EXPO_PUBLIC_PI_URL ?? "http://192.168.1.100:5000";
+const CV_STREAM_URL = `${GROUND_CONTROL_URL}/video_feed`;
+const MONITOR_API = `${GROUND_CONTROL_URL}/data`;
+const MISSION_API = `${PI_URL}/mission/status`;
+const POLL_MS = Number(process.env.EXPO_PUBLIC_POLL_INTERVAL ?? 3000);
 
-const GROUND_CONTROL_URL = process.env.EXPO_PUBLIC_GROUND_CONTROL_URL    ?? "http://192.168.1.100:5000";
-const MAPTILER_KEY       = process.env.EXPO_PUBLIC_MAPTILER_KEY          ?? "skibidigyaatnerizzler67rokunana";
-const PI_URL             = process.env.EXPO_PUBLIC_PI_URL                ?? "http://192.168.1.100:5000";
-
-const CV_STREAM_URL  = `${GROUND_CONTROL_URL}/video_feed`;
-const MONITOR_API    = `${GROUND_CONTROL_URL}/live-monitoring`;
-const MISSION_API    = `${PI_URL}/mission/status`;
-const POLL_MS        = Number(process.env.EXPO_PUBLIC_POLL_INTERVAL ?? 3000);
-
-const DEFAULT_LOCATION = { latitude: 14.502296, longitude: 120.992587 };
-const MAP_DELTA        = { latitudeDelta: 0.005, longitudeDelta: 0.005 };
-const MIN_ANIMATE_M    = 2; // only re-center map if vessel moved more than this
+// UPDATED: Baseline matching your exact asset deployment coordinate zone
+const DEFAULT_LOCATION = { latitude: 14.49351, longitude: 121.011168 };
+const MAP_DELTA = { latitudeDelta: 0.005, longitudeDelta: 0.005 };
+const MIN_ANIMATE_M = 2;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
 type Coords = { latitude: number; longitude: number };
-
 type MissionStatus = {
-  state:      string;
-  waypoints:  [number, number][];  // [lat, lon] tuples from Python
+  state: string;
+  waypoints: [number, number][];
   current_wp: number;
-  total_wp:   number;
+  total_wp: number;
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function distanceM(a: Coords, b: Coords): number {
-  const R  = 6_371_000;
-  const p1 = a.latitude  * Math.PI / 180;
-  const p2 = b.latitude  * Math.PI / 180;
-  const dp = (b.latitude  - a.latitude)  * Math.PI / 180;
-  const dl = (b.longitude - a.longitude) * Math.PI / 180;
-  const x  = Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
+  const R = 6_371_000;
+  const p1 = (a.latitude * Math.PI) / 180;
+  const p2 = (b.latitude * Math.PI) / 180;
+  const dp = ((b.latitude - a.latitude) * Math.PI) / 180;
+  const dl = ((b.longitude - a.longitude) * Math.PI) / 180;
+  const x =
+    Math.sin(dp / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(dl / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
-/** Compass bearing from A → B in degrees (0–360) */
 function bearingDeg(a: Coords, b: Coords): number {
   const toR = Math.PI / 180;
-  const dL  = (b.longitude - a.longitude) * toR;
-  const y   = Math.sin(dL) * Math.cos(b.latitude * toR);
-  const x   = Math.cos(a.latitude * toR) * Math.sin(b.latitude * toR)
-              - Math.sin(a.latitude * toR) * Math.cos(b.latitude * toR) * Math.cos(dL);
-  return ((Math.atan2(y, x) * 180 / Math.PI) + 360) % 360;
+  const dL = (b.longitude - a.longitude) * toR;
+  const y = Math.sin(dL) * Math.cos(b.latitude * toR);
+  const x =
+    Math.cos(a.latitude * toR) * Math.sin(b.latitude * toR) -
+    Math.sin(a.latitude * toR) * Math.cos(b.latitude * toR) * Math.cos(dL);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+// Strict structure check against malformed JSON keys
+function isValidCoordinate(coord: any): coord is Coords {
+  return (
+    coord &&
+    typeof coord.latitude === "number" &&
+    !isNaN(coord.latitude) &&
+    coord.latitude !== 0 &&
+    typeof coord.longitude === "number" &&
+    !isNaN(coord.longitude) &&
+    coord.longitude !== 0
+  );
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
-
 export default function MapViewScreen() {
   const mapRef = useRef<MapView | null>(null);
-
-  // Map data
-  const [location,      setLocation]      = useState<Coords>(DEFAULT_LOCATION);
-  const [trashMarkers,  setTrashMarkers]  = useState<Coords[]>([]);
-  const [waypointDots,  setWaypointDots]  = useState<Coords[]>([]);
-  const [missionStatus, setMissionStatus] = useState<MissionStatus | null>(null);
-  const [gpsOk,         setGpsOk]         = useState(false);
-
-  // Vessel heading (GPS-derived)
+  const [location, setLocation] = useState<Coords>(DEFAULT_LOCATION);
+  const [trashMarkers, setTrashMarkers] = useState<Coords[]>([]);
+  const [waypointDots, setWaypointDots] = useState<Coords[]>([]);
+  const [missionStatus, setMissionStatus] = useState<MissionStatus | null>(
+    null,
+  );
+  const [gpsOk, setGpsOk] = useState(false);
+  const [speed, setSpeed] = useState<number | null>(null);
   const [heading, setHeading] = useState<number>(0);
   const prevLocation = useRef<Coords | null>(null);
   const lastAnimated = useRef<Coords | null>(null);
-
-  // PiP stream state
   const [streamLoading, setStreamLoading] = useState(true);
-  const [streamError,   setStreamError]   = useState(false);
+  const [streamError, setStreamError] = useState(false);
 
-  // ─── Auto-center with movement threshold ────────────────────────────────
-
+  // ─── Auto-center ─────────────────────────────────────────────────────────
   const animateTo = useCallback((coords: Coords) => {
+    if (!isValidCoordinate(coords)) return;
     if (
       !lastAnimated.current ||
       distanceM(lastAnimated.current, coords) > MIN_ANIMATE_M
@@ -87,21 +95,36 @@ export default function MapViewScreen() {
   }, []);
 
   // ─── Data fetch ──────────────────────────────────────────────────────────
-
   const fetchData = useCallback(async () => {
-    // Map data from ground-control laptop
     try {
       const res = await fetch(MONITOR_API);
       if (!res.ok) throw new Error("Failed");
       const json = await res.json();
 
-      setTrashMarkers(json.trash_markers  || []);
-      setWaypointDots(json.waypoint_dots  || []);
+      setTrashMarkers(json.trash_markers || []);
+      setWaypointDots(json.waypoint_dots || []);
 
-      if (json.latitude !== 0 && json.longitude !== 0) {
-        const newCoords: Coords = { latitude: json.latitude, longitude: json.longitude };
+      if (typeof json.speed === "number") {
+        setSpeed(json.speed);
+      } else {
+        setSpeed(null);
+      }
 
-        // GPS-derived heading
+      // Safe numeric conversion layer to catch string conversions
+      const incomingLat = Number(json.latitude);
+      const incomingLng = Number(json.longitude);
+
+      if (
+        !isNaN(incomingLat) &&
+        incomingLat !== 0 &&
+        !isNaN(incomingLng) &&
+        incomingLng !== 0
+      ) {
+        const newCoords: Coords = {
+          latitude: incomingLat,
+          longitude: incomingLng,
+        };
+
         if (prevLocation.current) {
           const dist = distanceM(prevLocation.current, newCoords);
           if (dist > 1.5) {
@@ -116,21 +139,22 @@ export default function MapViewScreen() {
         setGpsOk(true);
         animateTo(newCoords);
       } else {
+        // Keeps the vessel visible at its last known location during dropouts
         setGpsOk(false);
       }
     } catch {
       setGpsOk(false);
     }
 
-    // Mission waypoints from Pi
     try {
       const mRes = await fetch(MISSION_API);
       if (mRes.ok) {
         const ms: MissionStatus = await mRes.json();
         setMissionStatus(ms);
       }
-    } catch { /* non-fatal */ }
-
+    } catch {
+      /* non-fatal */
+    }
   }, [animateTo]);
 
   useEffect(() => {
@@ -139,22 +163,28 @@ export default function MapViewScreen() {
     return () => clearInterval(id);
   }, [fetchData]);
 
-  // ─── Derived ─────────────────────────────────────────────────────────────
+  // ─── Derived Data Parsing ──────────────────────────────────────────────────
+  const missionWaypoints: Coords[] = (missionStatus?.waypoints ?? [])
+    .map(([lat, lon]) => ({ latitude: Number(lat), longitude: Number(lon) }))
+    .filter(isValidCoordinate);
 
-  // Convert Python [lat, lon] tuples → Coords objects for mission waypoints
-  const missionWaypoints: Coords[] = (missionStatus?.waypoints ?? []).map(
-    ([lat, lon]) => ({ latitude: lat, longitude: lon })
-  );
-  const currentWpIndex  = missionStatus?.current_wp ?? 0;
-  const missionActive   = missionStatus?.state !== "IDLE" && missionStatus != null;
+  const verifiedWaypointDots = (waypointDots ?? [])
+    .map((wp) => ({
+      latitude: Number(wp.latitude),
+      longitude: Number(wp.longitude),
+    }))
+    .filter(isValidCoordinate);
+
+  const currentWpIndex = missionStatus?.current_wp ?? 0;
+  const missionActive =
+    missionStatus?.state !== "IDLE" && missionStatus != null;
 
   // ─── Render ──────────────────────────────────────────────────────────────
-
   return (
     <SafeAreaView style={styles.container} edges={["top"]}>
       <StatusBar style="light" />
 
-      {/* ── Header ───────────────────────────────────────────────────────── */}
+      {/* Header */}
       <View style={styles.header}>
         <Text style={styles.headerTitle}>
           S.W.A.R.M <Text style={styles.headerAccent}>Navigator</Text>
@@ -169,15 +199,23 @@ export default function MapViewScreen() {
         )}
       </View>
 
-      {/* ── PiP AI stream ────────────────────────────────────────────────── */}
+      {/* Video Stream Overlay */}
       <View style={styles.videoOverlay}>
         <View style={styles.videoHeader}>
-          <View style={[styles.liveDot, streamError && { backgroundColor: "#6b7280" }]} />
+          <View
+            style={[
+              styles.liveDot,
+              streamError && { backgroundColor: "#6b7280" },
+            ]}
+          />
           <Text style={styles.videoTitle}>
-            {streamError ? "STREAM OFFLINE" : streamLoading ? "CONNECTING..." : "LIVE AI STREAM"}
+            {streamError
+              ? "STREAM OFFLINE"
+              : streamLoading
+                ? "CONNECTING..."
+                : "LIVE AI STREAM"}
           </Text>
         </View>
-
         {streamError ? (
           <View style={styles.streamOffline}>
             <Text style={styles.streamOfflineText}>📡</Text>
@@ -185,16 +223,38 @@ export default function MapViewScreen() {
           </View>
         ) : (
           <WebView
-            source={{ uri: CV_STREAM_URL }}
+            source={{
+              html: `
+                <html>
+                  <head>
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                    <style>
+                      body { margin: 0; padding: 0; background-color: #000; display: flex; justify-content: center; align-items: center; height: 100vh; width: 100vw; overflow: hidden; }
+                      img { width: 100%; height: 100%; object-fit: contain; }
+                    </style>
+                  </head>
+                  <body>
+                    <img src="${CV_STREAM_URL}" />
+                  </body>
+                </html>
+              `,
+            }}
             style={styles.webview}
             scrollEnabled={false}
             containerStyle={{ borderRadius: 8 }}
-            onLoadStart={() => { setStreamLoading(true);  setStreamError(false); }}
-            onLoadEnd={()   => { setStreamLoading(false); }}
-            onError={()     => { setStreamLoading(false); setStreamError(true);  }}
+            onLoadStart={() => {
+              setStreamLoading(true);
+              setStreamError(false);
+            }}
+            onLoadEnd={() => {
+              setStreamLoading(false);
+            }}
+            onError={() => {
+              setStreamLoading(false);
+              setStreamError(true);
+            }}
           />
         )}
-
         {streamLoading && !streamError && (
           <View style={styles.streamLoadingOverlay}>
             <Text style={styles.streamOfflineLabel}>Connecting...</Text>
@@ -202,12 +262,26 @@ export default function MapViewScreen() {
         )}
       </View>
 
-      {/* ── GPS status badge ─────────────────────────────────────────────── */}
-      <View style={[styles.statusBadge, gpsOk ? styles.statusOk : styles.statusWarn]}>
-        <Text style={styles.statusText}>{gpsOk ? "● GPS LOCKED" : "○ SIGNAL LOST"}</Text>
+      {/* GPS Status Indicator */}
+      <View
+        style={[
+          styles.statusBadge,
+          gpsOk ? styles.statusOk : styles.statusWarn,
+        ]}
+      >
+        {gpsOk ? (
+          <>
+            <Text style={styles.statusText}>● GPS LOCKED</Text>
+            <Text style={styles.statusSpeed}>
+              {speed !== null ? `${speed.toFixed(2)} m/s` : "-- m/s"}
+            </Text>
+          </>
+        ) : (
+          <Text style={styles.statusText}>○ SIGNAL LOST</Text>
+        )}
       </View>
 
-      {/* ── Map ──────────────────────────────────────────────────────────── */}
+      {/* Map Environment */}
       <MapView
         ref={mapRef}
         style={styles.map}
@@ -220,18 +294,17 @@ export default function MapViewScreen() {
           flipY={false}
         />
 
-        {/* Vessel historical trail — grey dashed line */}
-        {waypointDots.length > 1 && (
+        {/* Dynamic Route Polylines */}
+        {verifiedWaypointDots && verifiedWaypointDots.length > 1 && (
           <Polyline
-            coordinates={waypointDots}
+            coordinates={verifiedWaypointDots}
             strokeColor="rgba(148,163,184,0.5)"
             strokeWidth={2}
             lineDashPattern={[4, 4]}
           />
         )}
 
-        {/* Mission waypoint connector — blue solid line */}
-        {missionActive && missionWaypoints.length > 1 && (
+        {missionActive && missionWaypoints && missionWaypoints.length > 1 && (
           <Polyline
             coordinates={missionWaypoints}
             strokeColor="rgba(59,130,246,0.4)"
@@ -240,49 +313,81 @@ export default function MapViewScreen() {
           />
         )}
 
-        {/* Mission waypoints — numbered blue squares */}
-        {missionActive && missionWaypoints.map((wp, i) => {
-          const isCompleted = i < currentWpIndex;
-          const isCurrent   = i === currentWpIndex;
-          return (
-            <Marker key={`wp-${i}`} coordinate={wp} anchor={{ x: 0.5, y: 0.5 }}>
-              <View style={[
-                styles.waypointMarker,
-                isCompleted && styles.waypointCompleted,
-                isCurrent   && styles.waypointCurrent,
-              ]}>
-                <Text style={styles.waypointText}>{i + 1}</Text>
+        {/* Route Target Pins */}
+        {missionActive &&
+          missionWaypoints.map((wp, i) => {
+            const isCompleted = i < currentWpIndex;
+            const isCurrent = i === currentWpIndex;
+            return (
+              <Marker
+                key={`wp-${wp.latitude}-${wp.longitude}-${i}`}
+                coordinate={{ latitude: wp.latitude, longitude: wp.longitude }}
+                anchor={{ x: 0.5, y: 0.5 }}
+              >
+                <View
+                  style={[
+                    styles.waypointMarker,
+                    isCompleted && styles.waypointCompleted,
+                    isCurrent && styles.waypointCurrent,
+                  ]}
+                >
+                  <Text style={styles.waypointText}>{i + 1}</Text>
+                </View>
+              </Marker>
+            );
+          })}
+
+        {/* Trash Detection Array Pins */}
+        {trashMarkers
+          .map((m) => ({
+            latitude: Number(m.latitude),
+            longitude: Number(m.longitude),
+          }))
+          .filter(isValidCoordinate)
+          .map((marker, i) => (
+            <Marker
+              key={`trash-${marker.latitude}-${marker.longitude}-${i}`}
+              coordinate={{
+                latitude: marker.latitude,
+                longitude: marker.longitude,
+              }}
+              anchor={{ x: 0.5, y: 0.5 }}
+            >
+              <View style={styles.trashMarker}>
+                <Text style={styles.trashMarkerText}>{i + 1}</Text>
               </View>
             </Marker>
-          );
-        })}
+          ))}
 
-        {/* Trash markers — numbered red dots in detection order */}
-        {trashMarkers.map((marker, i) => (
-          <Marker
-            key={`trash-${i}`}
-            coordinate={marker}
-            anchor={{ x: 0.5, y: 0.5 }}
-          >
-            <View style={styles.trashMarker}>
-              <Text style={styles.trashMarkerText}>{i + 1}</Text>
-            </View>
-          </Marker>
-        ))}
-
-        {/* Vessel — pulsing circle with direction arrow */}
-        <Marker coordinate={location} anchor={{ x: 0.5, y: 0.5 }}>
-          <View style={styles.vesselOuter}>
-            {/* Direction arrow rotated to current heading */}
-            <View style={[styles.vesselArrow, { transform: [{ rotate: `${heading}deg` }] }]}>
-              <Text style={styles.vesselArrowText}>▲</Text>
-            </View>
-            <View style={styles.vesselCore} />
-          </View>
-        </Marker>
+        {/* Vessel Marker - Renders if location has numbers */}
+        {location &&
+          typeof location.latitude === "number" &&
+          typeof location.longitude === "number" && (
+            <Marker
+              coordinate={{
+                latitude: location.latitude,
+                longitude: location.longitude,
+              }}
+              anchor={{ x: 0.5, y: 0.5 }}
+              zIndex={999}
+            >
+              <View style={styles.vesselContainer}>
+                <View style={styles.vesselHalo} />
+                <View
+                  style={[
+                    styles.vesselArrowWrap,
+                    { transform: [{ rotate: `${heading}deg` }] },
+                  ]}
+                >
+                  <Text style={styles.vesselArrowText}>▲</Text>
+                </View>
+                <View style={styles.vesselCore} />
+              </View>
+            </Marker>
+          )}
       </MapView>
 
-      {/* ── Legend ───────────────────────────────────────────────────────── */}
+      {/* Map Legend */}
       <View style={styles.legend}>
         <View style={styles.legendRow}>
           <View style={styles.legendTrash} />
@@ -304,176 +409,225 @@ export default function MapViewScreen() {
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
-
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#0f172a" },
-  map:       { flex: 1 },
-
+  map: { flex: 1 },
   header: {
-    flexDirection:  "row",
-    alignItems:     "center",
+    flexDirection: "row",
+    alignItems: "center",
     justifyContent: "space-between",
     paddingHorizontal: 16,
-    paddingTop:     8,
-    paddingBottom:  6,
+    paddingTop: 8,
+    paddingBottom: 6,
   },
   headerTitle: { color: "#fff", fontSize: 20, fontWeight: "800" },
   headerAccent: { color: "#3b82f6" },
-
   missionChip: {
-    flexDirection:   "row",
-    alignItems:      "center",
-    gap:             6,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
     backgroundColor: "rgba(59,130,246,0.15)",
-    borderWidth:     1,
-    borderColor:     "rgba(59,130,246,0.4)",
-    borderRadius:    20,
+    borderWidth: 1,
+    borderColor: "rgba(59,130,246,0.4)",
+    borderRadius: 20,
     paddingHorizontal: 10,
     paddingVertical: 4,
   },
-  missionDot:      { width: 6, height: 6, borderRadius: 3, backgroundColor: "#3b82f6" },
+  missionDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#3b82f6",
+  },
   missionChipText: { color: "#3b82f6", fontSize: 10, fontWeight: "800" },
-
-  // ── PiP ──
   videoOverlay: {
-    position:        "absolute",
-    top:             80,
-    right:           16,
-    width:           176,
-    height:          138,
-    zIndex:          50,
+    position: "absolute",
+    top: 80,
+    right: 16,
+    width: 176,
+    height: 138,
+    zIndex: 50,
     backgroundColor: "#000",
-    borderRadius:    12,
-    borderWidth:     1.5,
-    borderColor:     "#1e293b",
-    overflow:        "hidden",
-    elevation:       5,
-    shadowColor:     "#000",
-    shadowOffset:    { width: 0, height: 4 },
-    shadowOpacity:   0.4,
-    shadowRadius:    6,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: "#1e293b",
+    overflow: "hidden",
+    elevation: 5,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 6,
   },
   videoHeader: {
-    flexDirection:   "row",
-    alignItems:      "center",
+    flexDirection: "row",
+    alignItems: "center",
     backgroundColor: "rgba(15,23,42,0.92)",
     paddingHorizontal: 8,
     paddingVertical: 4,
-    position:        "absolute",
-    top:             0,
-    width:           "100%",
-    zIndex:          51,
-    gap:             5,
+    position: "absolute",
+    top: 0,
+    width: "100%",
+    zIndex: 51,
+    gap: 5,
   },
-  liveDot:   { width: 6, height: 6, borderRadius: 3, backgroundColor: "#ef4444" },
-  videoTitle: { color: "#fff", fontSize: 9, fontWeight: "800", letterSpacing: 1 },
-  webview:   { flex: 1, marginTop: 22, backgroundColor: "#000" },
-
+  liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#ef4444" },
+  videoTitle: {
+    color: "#fff",
+    fontSize: 9,
+    fontWeight: "800",
+    letterSpacing: 1,
+  },
+  webview: { flex: 1, backgroundColor: "#000" },
   streamOffline: {
-    flex:           1,
-    marginTop:      22,
-    alignItems:     "center",
+    flex: 1,
+    marginTop: 22,
+    alignItems: "center",
+    justifyBox: "center",
     justifyContent: "center",
     backgroundColor: "#0f172a",
   },
-  streamOfflineText:  { fontSize: 20 },
+  streamOfflineText: { fontSize: 20 },
   streamOfflineLabel: { color: "#475569", fontSize: 10, marginTop: 4 },
   streamLoadingOverlay: {
-    position:       "absolute",
-    top:            22, left: 0, right: 0, bottom: 0,
-    alignItems:     "center",
+    position: "absolute",
+    top: 22,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: "center",
     justifyContent: "center",
     backgroundColor: "rgba(15,23,42,0.7)",
   },
-
-  // ── Status badge ──
   statusBadge: {
-    position:        "absolute",
-    top:             80,
-    left:            16,
-    paddingVertical: 5,
+    position: "absolute",
+    top: 80,
+    left: 16,
+    paddingVertical: 6,
     paddingHorizontal: 10,
-    borderRadius:    8,
-    zIndex:          10,
+    borderRadius: 8,
+    zIndex: 10,
+    gap: 2,
   },
-  statusOk:   { backgroundColor: "rgba(34,197,94,0.85)"  },
-  statusWarn: { backgroundColor: "rgba(239,68,68,0.85)"  },
-  statusText: { color: "#fff", fontWeight: "800", fontSize: 10, letterSpacing: 1 },
-
-  // ── Markers ──
+  statusOk: { backgroundColor: "rgba(34,197,94,0.85)" },
+  statusWarn: { backgroundColor: "rgba(239,68,68,0.85)" },
+  statusText: {
+    color: "#fff",
+    fontWeight: "800",
+    fontSize: 10,
+    letterSpacing: 1,
+  },
+  statusSpeed: {
+    color: "rgba(255,255,255,0.85)",
+    fontWeight: "600",
+    fontSize: 10,
+    letterSpacing: 0.5,
+  },
   trashMarker: {
-    width:           22,
-    height:          22,
-    borderRadius:    11,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
     backgroundColor: "#ef4444",
-    borderWidth:     2,
-    borderColor:     "#fff",
-    alignItems:      "center",
-    justifyContent:  "center",
+    borderWidth: 2,
+    borderColor: "#fff",
+    alignItems: "center",
+    justifyContent: "center",
   },
   trashMarkerText: { color: "#fff", fontSize: 9, fontWeight: "900" },
-
   waypointMarker: {
-    width:           20,
-    height:          20,
-    borderRadius:    4,
+    width: 20,
+    height: 20,
+    borderRadius: 4,
     backgroundColor: "rgba(59,130,246,0.8)",
-    borderWidth:     1.5,
-    borderColor:     "#93c5fd",
-    alignItems:      "center",
-    justifyContent:  "center",
+    borderWidth: 1.5,
+    borderColor: "#93c5fd",
+    alignItems: "center",
+    justifyContent: "center",
   },
   waypointCompleted: {
     backgroundColor: "rgba(71,85,105,0.6)",
-    borderColor:     "#475569",
+    borderColor: "#475569",
   },
   waypointCurrent: {
     backgroundColor: "#2563eb",
-    borderColor:     "#fff",
-    width:           24,
-    height:          24,
-    borderRadius:    5,
+    borderColor: "#fff",
+    width: 24,
+    height: 24,
+    borderRadius: 5,
   },
   waypointText: { color: "#fff", fontSize: 9, fontWeight: "900" },
-
-  vesselOuter: {
-    width:           32,
-    height:          32,
-    borderRadius:    16,
-    backgroundColor: "rgba(59,130,246,0.2)",
-    borderWidth:     1,
-    borderColor:     "rgba(59,130,246,0.4)",
-    alignItems:      "center",
-    justifyContent:  "center",
+  vesselContainer: {
+    width: 44,
+    height: 44,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  vesselArrow: {
+  vesselHalo: {
     position: "absolute",
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "rgba(6,182,212,0.20)",
+    borderWidth: 1.5,
+    borderColor: "rgba(6,182,212,0.55)",
   },
-  vesselArrowText: { color: "#93c5fd", fontSize: 12, fontWeight: "900" },
+  vesselArrowWrap: { position: "absolute" },
+  vesselArrowText: {
+    color: "#ffffff",
+    fontSize: 18,
+    fontWeight: "900",
+    textShadowColor: "rgba(0,0,0,0.8)",
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 4,
+  },
   vesselCore: {
-    width:           10,
-    height:          10,
-    borderRadius:    5,
-    backgroundColor: "#3b82f6",
-    borderWidth:     2,
-    borderColor:     "#fff",
+    position: "absolute",
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: "#06b6d4",
+    borderWidth: 2.5,
+    borderColor: "#ffffff",
+    elevation: 3,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.5,
+    shadowRadius: 2,
   },
-
-  // ── Legend ──
   legend: {
-    position:        "absolute",
-    bottom:          16,
-    left:            16,
+    position: "absolute",
+    bottom: 16,
+    left: 16,
     backgroundColor: "rgba(15,23,42,0.85)",
-    borderRadius:    10,
-    borderWidth:     1,
-    borderColor:     "#1e293b",
-    padding:         10,
-    gap:             6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#1e293b",
+    padding: 10,
+    gap: 6,
   },
-  legendRow:     { flexDirection: "row", alignItems: "center", gap: 8 },
-  legendLabel:   { color: "#94a3b8", fontSize: 10 },
-  legendTrash:   { width: 12, height: 12, borderRadius: 6,  backgroundColor: "#ef4444", borderWidth: 1.5, borderColor: "#fff" },
-  legendWaypoint:{ width: 12, height: 12, borderRadius: 2,  backgroundColor: "#3b82f6", borderWidth: 1,   borderColor: "#93c5fd" },
-  legendVessel:  { width: 12, height: 12, borderRadius: 6,  backgroundColor: "rgba(59,130,246,0.3)", borderWidth: 1, borderColor: "#3b82f6" },
+  legendRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  legendLabel: { color: "#94a3b8", fontSize: 10 },
+  legendTrash: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: "#ef4444",
+    borderWidth: 1.5,
+    borderColor: "#fff",
+  },
+  legendWaypoint: {
+    width: 12,
+    height: 12,
+    borderRadius: 2,
+    backgroundColor: "#3b82f6",
+    borderWidth: 1,
+    borderColor: "#93c5fd",
+  },
+  legendVessel: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: "#06b6d4",
+    borderWidth: 2,
+    borderColor: "#ffffff",
+  },
 });

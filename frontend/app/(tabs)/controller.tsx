@@ -1,3 +1,14 @@
+/**
+ * controller.tsx — Live Hardware Control Console
+ *
+ * Fix 1: Added a telemetry lockout timer to prevent the background poller
+ * from overwriting local manual basket states while an action is in progress.
+ * Fix 2: Add dynamic 'key' and fallback 'animate-none' props to the basket
+ * state text component to fix the NativeWind / CssInterop remount upgrade warning.
+ * Fix 3: Lock the basket open and close buttons so they are only interactive
+ * during manual override mode, matching throttle/steering behavior.
+ */
+
 import { useFocusEffect } from "expo-router";
 import * as ScreenOrientation from "expo-screen-orientation";
 import { StatusBar } from "expo-status-bar";
@@ -5,159 +16,358 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-type Mode    = "autonomous" | "manual";
+type Mode = "autonomous" | "manual";
 type Command = "FORWARD" | "STOP" | "LEFT" | "RIGHT";
+type BasketAction = "open" | "close";
+type BasketStatus = "OPEN" | "CLOSED" | "OPENING" | "CLOSING" | "UNKNOWN";
 
-const BASE_URL  = process.env.EXPO_PUBLIC_PI_URL ?? "http://192.168.1.100:5000";
+const BASE_URL = process.env.EXPO_PUBLIC_PI_URL ?? "http://192.168.1.100:5000";
 const REPEAT_MS = 300;
+const SPEED_POLL_MS = 500;
 
-// ─── Network helpers ──────────────────────────────────────────────────────────
-
-/** Manual motor command — fire-and-forget GET /debug-command */
 function fireCommand(cmd: Command) {
-  fetch(`${BASE_URL}/debug-command?cmd=${cmd}`)
-    .catch((e) => console.warn("[CTRL fire]", cmd, e));
+  fetch(`${BASE_URL}/debug-command?cmd=${cmd}`).catch((e) =>
+    console.warn("[CTRL fire]", cmd, e),
+  );
 }
 
-/** Tell the Pi which mode is active (gates /control vs /debug-command) */
-async function setServerMode(mode: Mode) {
+async function setServerMode(mode: Mode): Promise<boolean> {
   try {
-    await fetch(`${BASE_URL}/mode`, {
-      method:  "POST",
+    const res = await fetch(`${BASE_URL}/mode`, {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ mode }),
+      body: JSON.stringify({ mode }),
     });
+    return res.ok;
   } catch (e) {
     console.warn("[CTRL] Failed to set server mode", e);
+    return false;
   }
 }
 
-/** Tell the Pi to stop its autonomous mission survey */
-async function stopMission() {
+async function stopMission(): Promise<boolean> {
   try {
-    await fetch(`${BASE_URL}/mission`, {
-      method:  "POST",
+    const res = await fetch(`${BASE_URL}/mission`, {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify({ action: "stop" }),
+      body: JSON.stringify({ action: "stop" }),
     });
+    return res.ok;
   } catch (e) {
     console.warn("[CTRL] Failed to stop mission", e);
+    return false;
   }
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
-
 export default function Controller() {
-  const [mode,      setMode]      = useState<Mode>("autonomous");
-  const [activeCmd, setActiveCmd] = useState<Command | null>(null);
+  const [mode, setMode] = useState<Mode>("autonomous");
+  const [activeThrot, setActiveThrot] = useState<"FORWARD" | null>(null);
+  const [activeSteer, setActiveSteer] = useState<"LEFT" | "RIGHT" | null>(null);
 
-  // RTH state
+  const [modeLoading, setModeLoading] = useState(false);
+  const [modeError, setModeError] = useState<string | null>(null);
+
   const [rthLoading, setRthLoading] = useState(false);
-  const [rthError,   setRthError]   = useState<string | null>(null);
-  const [rthActive,  setRthActive]  = useState(false);  // true while Pi is returning
+  const [rthError, setRthError] = useState<string | null>(null);
+  const [rthActive, setRthActive] = useState(false);
 
-  const repeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [speed, setSpeed] = useState<number | null>(null);
 
-  // Lock to landscape while this screen is focused
+  // Basket States
+  const [basketState, setBasketState] = useState<BasketStatus>("UNKNOWN");
+  const [basketLoading, setBasketLoading] = useState(false);
+
+  const throttleInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const steeringInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const speedInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isMounted = useRef<boolean>(true);
+
+  // Ref to lock out background telemetry from overwriting our manual basket clicks
+  const basketLockoutRef = useRef<boolean>(false);
+  const lockoutTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   useFocusEffect(
     useCallback(() => {
       ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.LANDSCAPE);
       return () => {
-        stopRepeat();
+        stopThrottleLoop();
+        stopSteeringLoop();
         fireCommand("STOP");
-        ScreenOrientation.lockAsync(ScreenOrientation.OrientationLock.PORTRAIT_UP);
+        ScreenOrientation.lockAsync(
+          ScreenOrientation.OrientationLock.PORTRAIT_UP,
+        );
       };
-    }, [])
+    }, []),
   );
 
-  useEffect(() => () => stopRepeat(), []);
+  useEffect(() => {
+    isMounted.current = true;
+    return () => {
+      isMounted.current = false;
+      stopThrottleLoop();
+      stopSteeringLoop();
+      if (lockoutTimeoutRef.current) clearTimeout(lockoutTimeoutRef.current);
+    };
+  }, []);
 
-  // ─── Repeat helpers ───────────────────────────────────────────────────────
+  // ─── Telemetry Poller ──────────────────────────────────────────────────────
+  useEffect(() => {
+    async function fetchTelemetry() {
+      try {
+        const res = await fetch(`${BASE_URL}/control-panel`);
+        if (!res.ok) return;
+        const json = await res.json();
 
-  function stopRepeat() {
-    if (repeatRef.current) {
-      clearInterval(repeatRef.current);
-      repeatRef.current = null;
+        if (isMounted.current) {
+          if (typeof json.speed === "number") setSpeed(json.speed);
+
+          // Only sync basket state if we aren't actively processing a manual change
+          if (json.basket_state && !basketLockoutRef.current) {
+            setBasketState(json.basket_state.toUpperCase());
+          }
+        }
+      } catch {
+        /* non-fatal */
+      }
+    }
+
+    fetchTelemetry();
+    speedInterval.current = setInterval(fetchTelemetry, SPEED_POLL_MS);
+    return () => {
+      if (speedInterval.current) clearInterval(speedInterval.current);
+    };
+  }, []);
+
+  // ─── Input Managers ────────────────────────────────────────────────────────
+  function stopThrottleLoop() {
+    if (throttleInterval.current) {
+      clearInterval(throttleInterval.current);
+      throttleInterval.current = null;
     }
   }
 
-  // ─── Motor press handlers ─────────────────────────────────────────────────
+  function stopSteeringLoop() {
+    if (steeringInterval.current) {
+      clearInterval(steeringInterval.current);
+      steeringInterval.current = null;
+    }
+  }
 
-  function handlePressIn(cmd: Command) {
+  function handleThrottleIn(cmd: "FORWARD") {
     if (mode !== "manual") return;
-    setActiveCmd(cmd);
+    setActiveThrot(cmd);
     fireCommand(cmd);
-    stopRepeat();
-    repeatRef.current = setInterval(() => fireCommand(cmd), REPEAT_MS);
+    stopThrottleLoop();
+    throttleInterval.current = setInterval(() => fireCommand(cmd), REPEAT_MS);
   }
 
-  function handlePressOut() {
-    stopRepeat();
-    setActiveCmd(null);
-    fireCommand("STOP");
+  function handleThrottleOut() {
+    stopThrottleLoop();
+    setActiveThrot(null);
+    if (activeSteer) {
+      fireCommand(activeSteer);
+    } else {
+      fireCommand("STOP");
+    }
   }
 
-  // ─── Mode switchers ───────────────────────────────────────────────────────
+  function handleSteeringIn(cmd: "LEFT" | "RIGHT") {
+    if (mode !== "manual") return;
+    setActiveSteer(cmd);
+    fireCommand(cmd);
+    stopSteeringLoop();
+    steeringInterval.current = setInterval(() => fireCommand(cmd), REPEAT_MS);
+  }
 
+  function handleSteeringOut() {
+    stopSteeringLoop();
+    setActiveSteer(null);
+    if (activeThrot) {
+      fireCommand(activeThrot);
+    } else {
+      fireCommand("STOP");
+    }
+  }
+
+  // ─── Basket Control Actuators ──────────────────────────────────────────────
+  async function handleBasketControl(action: BasketAction) {
+    if (mode !== "manual" || basketLoading) return;
+
+    setBasketLoading(true);
+    // Instantly set a transition state and activate the poller lockout
+    setBasketState(action === "open" ? "OPENING" : "CLOSING");
+    basketLockoutRef.current = true;
+
+    if (lockoutTimeoutRef.current) clearTimeout(lockoutTimeoutRef.current);
+
+    try {
+      const res = await fetch(`${BASE_URL}/basket`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+
+      // Keep the lock active briefly even after the request finishes
+      // so the physical hardware has time to change its state.
+      lockoutTimeoutRef.current = setTimeout(() => {
+        basketLockoutRef.current = false;
+      }, 5000);
+    } catch (e) {
+      console.warn("[CTRL] Failed basket payload transmission", e);
+      basketLockoutRef.current = false; // Release lock immediately on network fault
+    } finally {
+      if (isMounted.current) setBasketLoading(false);
+    }
+  }
+
+  // ─── Mode Arbitrators ──────────────────────────────────────────────────────
   async function goManual() {
-    setRthError(null);
-    setRthActive(false);
-    await setServerMode("manual");
+    if (modeLoading) return;
+    setModeLoading(true);
+    setModeError(null);
+
+    const modeOk = await setServerMode("manual");
+    if (!modeOk) {
+      if (isMounted.current) {
+        setModeError("Could not reach Pi — mode not changed");
+        setModeLoading(false);
+      }
+      return;
+    }
+
     await stopMission();
-    setMode("manual");
+
+    if (isMounted.current) {
+      setRthError(null);
+      setRthActive(false);
+      setMode("manual");
+      setModeLoading(false);
+    }
   }
 
   async function goAuto() {
-    stopRepeat();
-    setActiveCmd(null);
+    if (modeLoading) return;
+    setModeLoading(true);
+    setModeError(null);
+
+    stopThrottleLoop();
+    stopSteeringLoop();
+    setActiveThrot(null);
+    setActiveSteer(null);
     fireCommand("STOP");
-    await setServerMode("autonomous");
-    setMode("autonomous");
+
+    const ok = await setServerMode("autonomous");
+    if (!ok) {
+      if (isMounted.current) {
+        setModeError("Could not reach Pi — mode not changed");
+        setModeLoading(false);
+      }
+      return;
+    }
+
+    if (isMounted.current) {
+      setMode("autonomous");
+      setModeLoading(false);
+    }
   }
 
-  // ─── Return to home ───────────────────────────────────────────────────────
-
+  // ─── Return to Home Operations ─────────────────────────────────────────────
   async function handleReturnHome() {
     setRthLoading(true);
     setRthError(null);
     try {
-      const res  = await fetch(`${BASE_URL}/return-home`, { method: "POST" });
+      const res = await fetch(`${BASE_URL}/return-home`, { method: "POST" });
       const json = await res.json();
+
+      if (!isMounted.current) return;
+
       if (!res.ok) {
-        // 400 = no home position saved yet
         setRthError(json.error ?? "Return to home failed");
+        setRthLoading(false);
         return;
       }
       setRthActive(true);
-    } catch (e: any) {
-      setRthError("Cannot reach Pi");
+    } catch {
+      if (isMounted.current) setRthError("Cannot reach Pi");
     } finally {
-      setRthLoading(false);
+      if (isMounted.current) setRthLoading(false);
     }
   }
 
-  // Cancel RTH (sends STOP + switches mission to idle via goAuto re-init)
   async function cancelRth() {
-    await stopMission();
-    setRthActive(false);
-    setRthError(null);
+    const ok = await stopMission();
+    if (ok && isMounted.current) {
+      setRthActive(false);
+      setRthError(null);
+    } else if (isMounted.current) {
+      setRthError("Failed to cancel RTH — Check link safety!");
+    }
   }
 
-  // ─── Derived ──────────────────────────────────────────────────────────────
-
+  // ─── Layout Visual Configurations ──────────────────────────────────────────
   const isManual = mode === "manual";
 
-  function dpadCls(cmd: Command) {
-    if (!isManual)         return "opacity-25 bg-slate-800 border-slate-700";
-    if (activeCmd === cmd) return "bg-blue-500 border-blue-300";
+  function throttleCls() {
+    if (!isManual) return "opacity-25 bg-slate-800 border-slate-700";
+    if (activeThrot === "FORWARD") return "bg-blue-500 border-blue-300";
     return "bg-slate-800 border-slate-600 active:bg-slate-700";
   }
 
-  const steerLabel =
-    activeCmd === "LEFT"  ? "← LEFT"  :
-    activeCmd === "RIGHT" ? "RIGHT →" : "CENTER";
+  function steeringCls(cmd: "LEFT" | "RIGHT") {
+    if (!isManual) return "opacity-25 bg-slate-800 border-slate-700";
+    if (activeSteer === cmd) return "bg-blue-500 border-blue-300";
+    return "bg-slate-800 border-slate-600 active:bg-slate-700";
+  }
 
-  // ─── Render ───────────────────────────────────────────────────────────────
+  // Helper handling layout classes for open/close configurations dynamically
+  function basketBtnCls(actionType: BasketAction) {
+    if (!isManual) return "opacity-25 bg-slate-800 border-slate-700";
+
+    const baseStyle = "bg-slate-800 border-slate-600 ";
+    if (actionType === "open") {
+      return (
+        baseStyle +
+        (basketState === "OPENING"
+          ? "border-emerald-500 bg-slate-900"
+          : "active:bg-emerald-950/40")
+      );
+    } else {
+      return (
+        baseStyle +
+        (basketState === "CLOSING"
+          ? "border-amber-500 bg-slate-900"
+          : "active:bg-amber-950/40")
+      );
+    }
+  }
+
+  const steerLabel =
+    activeSteer === "LEFT"
+      ? "← LEFT"
+      : activeSteer === "RIGHT"
+        ? "RIGHT →"
+        : "CENTER";
+
+  const speedColor =
+    speed !== null && speed > 0.05 ? "text-blue-400" : "text-slate-500";
+  const speedLabel = speed !== null ? `${speed.toFixed(2)} m/s` : "--";
+
+  const getBasketStatusClassName = () => {
+    if (!isManual)
+      return "text-[10px] font-bold tracking-wider text-slate-500 animate-none";
+
+    switch (basketState) {
+      case "OPEN":
+        return "text-[10px] font-bold tracking-wider text-emerald-400 animate-none";
+      case "CLOSED":
+        return "text-[10px] font-bold tracking-wider text-amber-500 animate-none";
+      case "OPENING":
+      case "CLOSING":
+        return "text-[10px] font-bold tracking-wider text-blue-400 animate-pulse";
+      default:
+        return "text-[10px] font-bold tracking-wider text-slate-500 animate-none";
+    }
+  };
 
   return (
     <SafeAreaView
@@ -166,195 +376,253 @@ export default function Controller() {
     >
       <StatusBar style="light" hidden />
 
-      {/* ── Top bar ───────────────────────────────────────────────────────── */}
+      {/* Header Bar */}
       <View className="flex-row items-center justify-between px-6 pt-2 pb-1 border-b border-slate-800">
         <Text className="text-slate-500 text-[10px] font-bold tracking-[5px]">
-          S.W.A.R.M · CONTROLLER
+          S.W.A.R.M · CONSOLE
         </Text>
 
-        {/* Mode toggle */}
-        <View className="flex-row bg-slate-800 rounded-xl p-1 gap-1">
-          <Pressable
-            onPress={goAuto}
-            className={`px-5 py-1.5 rounded-lg items-center ${
-              mode === "autonomous" ? "bg-blue-600" : ""
-            }`}
-          >
-            <Text className="text-white text-xs font-bold tracking-widest">AUTONOMOUS</Text>
-          </Pressable>
-          <Pressable
-            onPress={goManual}
-            className={`px-5 py-1.5 rounded-lg items-center ${
-              mode === "manual" ? "bg-blue-600" : ""
-            }`}
-          >
-            <Text className="text-white text-xs font-bold tracking-widest">MANUAL</Text>
-          </Pressable>
+        <View className="flex-1 max-w-md mx-4">
+          {modeError ? (
+            <Text className="text-red-400 text-[10px] font-semibold text-center bg-red-950/40 py-1 rounded border border-red-900/50">
+              {modeError}
+            </Text>
+          ) : rthActive ? (
+            <Text className="text-amber-400 text-[10px] font-semibold text-center bg-amber-950/40 py-1 rounded border border-amber-900/50">
+              ⚠️ Vessel executing Return-To-Home sequence
+            </Text>
+          ) : !isManual ? (
+            <Text className="text-green-400 text-[10px] font-semibold text-center bg-green-950/40 py-1 rounded border border-green-900/50">
+              🤖 Autonomous pilot operating mission track
+            </Text>
+          ) : (
+            <Text className="text-blue-400 text-[10px] font-semibold text-center bg-blue-950/40 py-1 rounded border border-blue-900/50">
+              🎮 Manual override controls active
+            </Text>
+          )}
         </View>
 
-        {/* Live mode indicator */}
-        <View className="flex-row items-center gap-2">
-          <View className={`w-2 h-2 rounded-full ${isManual ? "bg-blue-400" : "bg-green-400"}`} />
-          <Text className={`text-xs font-bold tracking-widest ${isManual ? "text-blue-400" : "text-green-400"}`}>
-            {isManual ? "MANUAL" : "AUTO"}
-          </Text>
+        <View className="flex-row items-center gap-4">
+          <View
+            className={`flex-row bg-slate-800 rounded-xl p-1 gap-1 ${modeLoading ? "opacity-60" : ""}`}
+          >
+            <Pressable
+              onPress={goAuto}
+              disabled={modeLoading}
+              className={`px-4 py-1.5 rounded-lg ${mode === "autonomous" ? "bg-blue-600" : ""}`}
+            >
+              <Text className="text-white text-[10px] font-bold tracking-widest">
+                AUTONOMOUS
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={goManual}
+              disabled={modeLoading}
+              className={`px-4 py-1.5 rounded-lg ${mode === "manual" ? "bg-blue-600" : ""}`}
+            >
+              <Text className="text-white text-[10px] font-bold tracking-widest">
+                MANUAL
+              </Text>
+            </Pressable>
+          </View>
+
+          <View className="flex-row items-center gap-2 min-w-[75px] justify-end">
+            <View
+              className={`w-2 h-2 rounded-full ${modeLoading ? "bg-yellow-400" : isManual ? "bg-blue-400" : "bg-green-400"}`}
+            />
+            <Text
+              className={`text-[10px] font-bold tracking-wider ${modeLoading ? "text-yellow-400" : isManual ? "text-blue-400" : "text-green-400"}`}
+            >
+              {modeLoading ? "SYNCING" : isManual ? "MANUAL" : "AUTO"}
+            </Text>
+          </View>
         </View>
       </View>
 
-      {/* ── Main 3-column layout ──────────────────────────────────────────── */}
-      <View className="flex-1 flex-row items-center justify-around px-6 py-3">
-
-        {/* LEFT: Throttle */}
-        <View className="items-center gap-4">
-          <Text className="text-slate-500 text-[10px] tracking-[4px] font-bold">THROTTLE</Text>
-
+      {/* Main Control Console Layout */}
+      <View className="flex-1 flex-row items-center justify-around px-6 py-2">
+        {/* Throttle Block */}
+        <View className="items-center gap-3">
+          <Text className="text-slate-500 text-[10px] tracking-[4px] font-bold">
+            THROTTLE
+          </Text>
           <Pressable
-            onPressIn={() => handlePressIn("FORWARD")}
-            onPressOut={handlePressOut}
+            onPressIn={() => handleThrottleIn("FORWARD")}
+            onPressOut={handleThrottleOut}
             disabled={!isManual}
-            className={`w-24 h-24 rounded-2xl items-center justify-center border-2 ${dpadCls("FORWARD")}`}
+            className={`w-24 h-24 rounded-2xl items-center justify-center border-2 ${throttleCls()}`}
           >
-            <Text className="text-white text-4xl leading-none">▲</Text>
-            <Text className="text-slate-400 text-[10px] mt-1 tracking-widest">FWD</Text>
+            <Text className="text-white text-3xl">▲</Text>
+            <Text className="text-slate-400 text-[9px] mt-0.5 tracking-widest">
+              FWD
+            </Text>
           </Pressable>
-
-          <View className="px-4 py-1.5 rounded-lg bg-slate-800/60 border border-slate-700 min-w-[80px] items-center">
+          <View className="px-3 py-1 rounded-lg bg-slate-800/60 border border-slate-700 min-w-[80px] items-center">
             <Text className="text-slate-400 text-[10px] tracking-wider">
-              {isManual ? (activeCmd === "FORWARD" ? "MOVING" : "IDLE") : "AUTO"}
+              {isManual ? (activeThrot ? "DRIVING" : "IDLE") : "LOCKED"}
             </Text>
           </View>
         </View>
 
-        {/* CENTRE: E-STOP + RTH + steer readout */}
-        <View className="items-center gap-3" style={{ width: 180 }}>
+        {/* Basket Controls */}
+        <View className="items-center gap-3">
+          <Text className="text-slate-500 text-[10px] tracking-[4px] font-bold">
+            BASKET
+          </Text>
+          <View className="flex-row items-center gap-2">
+            <Pressable
+              onPress={() => handleBasketControl("open")}
+              disabled={!isManual || basketLoading}
+              className={`w-20 h-20 rounded-2xl items-center justify-center border-2 ${basketBtnCls("open")} ${basketLoading ? "opacity-50" : ""}`}
+            >
+              <Text className="text-emerald-400 text-xl">📂</Text>
+              <Text className="text-slate-300 text-[9px] mt-1 font-bold tracking-widest">
+                OPEN
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => handleBasketControl("close")}
+              disabled={!isManual || basketLoading}
+              className={`w-20 h-20 rounded-2xl items-center justify-center border-2 ${basketBtnCls("close")} ${basketLoading ? "opacity-50" : ""}`}
+            >
+              <Text className="text-amber-500 text-xl">📁</Text>
+              <Text className="text-slate-300 text-[9px] mt-1 font-bold tracking-widest">
+                CLOSE
+              </Text>
+            </Pressable>
+          </View>
+          <View className="px-3 py-1 rounded-lg bg-slate-800/60 border border-slate-700 min-w-[120px] items-center">
+            <Text key={basketState} className={getBasketStatusClassName()}>
+              {isManual ? basketState : "LOCKED"}
+            </Text>
+          </View>
+        </View>
 
-          {/* E-STOP — always pressable */}
+        {/* Center Diagnostics & Safety System */}
+        <View className="items-center gap-2.5" style={{ width: 190 }}>
           <Pressable
             onPress={() => {
-              stopRepeat();
-              setActiveCmd(null);
+              stopThrottleLoop();
+              stopSteeringLoop();
+              setActiveThrot(null);
+              setActiveSteer(null);
               setRthActive(false);
               fireCommand("STOP");
               stopMission();
             }}
-            className="w-full rounded-2xl py-5 items-center border-2 border-red-500 bg-red-950/60 active:bg-red-700/40"
-            style={{ shadowColor: "#ef4444", shadowOpacity: 0.35, shadowRadius: 12, elevation: 6 }}
+            className="w-full rounded-xl py-3.5 items-center border-2 border-red-500 bg-red-950/60 active:bg-red-700/40"
           >
-            <Text className="text-red-400 text-3xl font-black leading-none">■</Text>
-            <Text className="text-red-400 text-xs font-bold tracking-[4px] mt-1">E-STOP</Text>
+            <Text className="text-red-400 text-xl font-black leading-none">
+              ■
+            </Text>
+            <Text className="text-red-400 text-[10px] font-bold tracking-[3px] mt-1">
+              EMERGENCY STOP
+            </Text>
           </Pressable>
 
-          {/* Return to Home — only in AUTO mode */}
           {rthActive ? (
-            /* RTH in progress — show cancel */
             <Pressable
               onPress={cancelRth}
-              className="w-full rounded-2xl py-3 items-center border-2 border-amber-500 bg-amber-950/60 active:bg-amber-700/40"
+              className="w-full rounded-xl py-2.5 items-center border-2 border-amber-500 bg-amber-950/60 active:bg-amber-700/40"
             >
               <Text className="text-amber-400 text-[10px] font-bold tracking-widest">
-                ⟳ RETURNING HOME
+                ⟳ ABORT RETURN HOME
               </Text>
-              <Text className="text-amber-600 text-[9px] mt-0.5">tap to cancel</Text>
+              <Text className="text-amber-600 text-[8px] mt-0.5">
+                tap to resume autopilot
+              </Text>
             </Pressable>
           ) : (
             <Pressable
               onPress={handleReturnHome}
               disabled={isManual || rthLoading}
-              className={`w-full rounded-2xl py-3 items-center border ${
+              className={`w-full rounded-xl py-2.5 items-center border ${
                 isManual
                   ? "opacity-25 bg-slate-800 border-slate-700"
                   : rthLoading
-                  ? "bg-slate-700 border-slate-600 opacity-60"
-                  : "bg-slate-800 border-slate-500 active:bg-slate-700"
+                    ? "bg-slate-700 border-slate-600 opacity-60"
+                    : "bg-slate-800 border-slate-500 active:bg-slate-700"
               }`}
             >
-              <Text className={`text-[10px] font-bold tracking-widest ${
-                isManual ? "text-slate-600" : "text-slate-300"
-              }`}>
-                {rthLoading ? "CONTACTING..." : "⌂ RETURN TO HOME"}
+              <Text
+                className={`text-[10px] font-bold tracking-widest ${isManual ? "text-slate-600" : "text-slate-300"}`}
+              >
+                {rthLoading ? "LINKING..." : "⌂ RETURN TO HOME"}
               </Text>
             </Pressable>
           )}
 
-          {/* RTH error */}
           {rthError && (
-            <View className="w-full bg-red-950/40 border border-red-800/60 rounded-lg px-3 py-1.5">
-              <Text className="text-red-400 text-[9px] text-center">{rthError}</Text>
+            <View className="w-full bg-red-950/40 border border-red-800/60 rounded-lg py-1">
+              <Text className="text-red-400 text-[8px] text-center">
+                {rthError}
+              </Text>
             </View>
           )}
 
-          {/* Steer readout */}
-          <View className="w-full bg-slate-800/80 rounded-xl px-4 py-2 border border-slate-700 items-center">
-            <Text className="text-slate-500 text-[10px] tracking-widest mb-0.5">STEERING</Text>
-            <Text className={`text-sm font-bold tracking-wider ${
-              activeCmd === "LEFT" || activeCmd === "RIGHT" ? "text-blue-400" : "text-slate-300"
-            }`}>
-              {isManual ? steerLabel : "AUTO"}
+          <View className="w-full bg-slate-800/80 rounded-xl px-4 py-1.5 border border-slate-700 items-center">
+            <Text className="text-slate-500 text-[9px] tracking-widest">
+              STEERING
+            </Text>
+            <Text
+              className={`text-xs font-bold tracking-wider ${activeSteer ? "text-blue-400" : "text-slate-300"}`}
+            >
+              {isManual ? steerLabel : "AUTOPILOT"}
+            </Text>
+          </View>
+
+          <View className="w-full bg-slate-800/80 rounded-xl px-4 py-1.5 border border-slate-700 items-center">
+            <Text className="text-slate-500 text-[9px] tracking-widest">
+              GROUND SPEED
+            </Text>
+            <Text className={`text-xs font-bold tracking-wider ${speedColor}`}>
+              {speedLabel}
             </Text>
           </View>
         </View>
 
-        {/* RIGHT: Steering */}
-        <View className="items-center gap-4">
-          <Text className="text-slate-500 text-[10px] tracking-[4px] font-bold">STEERING</Text>
-
+        {/* Steering Block */}
+        <View className="items-center gap-3">
+          <Text className="text-slate-500 text-[10px] tracking-[4px] font-bold">
+            STEERING
+          </Text>
           <View className="flex-row items-center gap-3">
             <Pressable
-              onPressIn={() => handlePressIn("LEFT")}
-              onPressOut={handlePressOut}
+              onPressIn={() => handleSteeringIn("LEFT")}
+              onPressOut={handleSteeringOut}
               disabled={!isManual}
-              className={`w-24 h-24 rounded-2xl items-center justify-center border-2 ${dpadCls("LEFT")}`}
+              className={`w-24 h-24 rounded-2xl items-center justify-center border-2 ${steeringCls("LEFT")}`}
             >
-              <Text className="text-white text-4xl leading-none">◄</Text>
-              <Text className="text-slate-400 text-[10px] mt-1 tracking-widest">LEFT</Text>
+              <Text className="text-white text-3xl">◄</Text>
+              <Text className="text-slate-400 text-[9px] mt-0.5 tracking-widest">
+                LEFT
+              </Text>
             </Pressable>
 
-            <View className={`w-3 h-3 rounded-full ${
-              activeCmd === "LEFT" || activeCmd === "RIGHT" ? "bg-blue-400" : "bg-slate-700"
-            }`} />
+            <View
+              className={`w-2.5 h-2.5 rounded-full ${activeSteer ? "bg-blue-400" : "bg-slate-700"}`}
+            />
 
             <Pressable
-              onPressIn={() => handlePressIn("RIGHT")}
-              onPressOut={handlePressOut}
+              onPressIn={() => handleSteeringIn("RIGHT")}
+              onPressOut={handleSteeringOut}
               disabled={!isManual}
-              className={`w-24 h-24 rounded-2xl items-center justify-center border-2 ${dpadCls("RIGHT")}`}
+              className={`w-24 h-24 rounded-2xl items-center justify-center border-2 ${steeringCls("RIGHT")}`}
             >
-              <Text className="text-white text-4xl leading-none">►</Text>
-              <Text className="text-slate-400 text-[10px] mt-1 tracking-widest">RIGHT</Text>
+              <Text className="text-white text-3xl">►</Text>
+              <Text className="text-slate-400 text-[9px] mt-0.5 tracking-widest">
+                RIGHT
+              </Text>
             </Pressable>
           </View>
 
-          <View className="px-4 py-1.5 rounded-lg bg-slate-800/60 border border-slate-700 min-w-[80px] items-center">
+          <View className="px-4 py-1 rounded-lg bg-slate-800/60 border border-slate-700 min-w-[80px] items-center">
             <Text className="text-slate-400 text-[10px] tracking-wider">
               {isManual ? steerLabel : "LOCKED"}
             </Text>
           </View>
         </View>
-
       </View>
-
-      {/* ── Bottom banners ────────────────────────────────────────────────── */}
-      {!isManual && !rthActive && (
-        <View className="absolute bottom-4 left-0 right-0 items-center">
-          <View className="flex-row items-center gap-2 bg-green-950/80 border border-green-800/60 rounded-full px-5 py-2">
-            <View className="w-2 h-2 rounded-full bg-green-400" />
-            <Text className="text-green-400 text-[11px] font-bold tracking-[3px]">
-              AUTONOMOUS MODE — CONTROLS LOCKED
-            </Text>
-          </View>
-        </View>
-      )}
-
-      {rthActive && (
-        <View className="absolute bottom-4 left-0 right-0 items-center">
-          <View className="flex-row items-center gap-2 bg-amber-950/80 border border-amber-800/60 rounded-full px-5 py-2">
-            <View className="w-2 h-2 rounded-full bg-amber-400" />
-            <Text className="text-amber-400 text-[11px] font-bold tracking-[3px]">
-              RETURNING TO HOME POSITION
-            </Text>
-          </View>
-        </View>
-      )}
     </SafeAreaView>
   );
 }

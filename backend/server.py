@@ -1,6 +1,6 @@
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi import FastAPI, Query
-import requests
+import httpx
 import uvicorn
 
 from mission_manager import MissionManager
@@ -8,26 +8,99 @@ from sensor import arduino
 from sensor import gps
 
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from typing import Optional, Literal
+import asyncio
+import logging
 import threading
 import random
 import time
 import cv2
 import os
 
-
 # ---------------------------------------------------------------------------
 # Singletons / constants
 # ---------------------------------------------------------------------------
 mission = MissionManager()
-load_dotenv
-# Shared mode gate — set by the phone via POST /mode
-# "manual"     → /debug-command executes,  AUTO packets from laptop are dropped
-# "autonomous" → AUTO packets execute,     /debug-command calls are dropped
-server_mode: str = "autonomous"  # default: autonomous on boot
-OBSTACLE_DISTANCE  = 30          # cm — below this a direction is blocked
-GROUND_STATION_URL = os.getenv('GROUND_CONTROL_URL')   # your laptop's IP
+load_dotenv()
+logger = logging.getLogger(__name__)
+http_client: Optional[httpx.AsyncClient] = None
+
+server_mode: str = "autonomous"
+
+OBSTACLE_DISTANCE       = 30          # cm
+GROUND_STATION_URL      = os.getenv('GROUND_CONTROL_URL')
+TRASH_COLLECTED_COUNT   = 0           # Limit: 30 trash
+
+# How long the basket stays open after GO_TRASH before server auto-closes it.
+BASKET_OPEN_DURATION_S: float = 4.0
+
+# Track whether we already have a pending close scheduled.
+_basket_close_timer: threading.Timer = None
+_basket_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (async)
+# ---------------------------------------------------------------------------
+async def _post_ground_station(payload: dict) -> None:
+    """Send a JSON payload to the ground‑control server."""
+    if not GROUND_STATION_URL:
+        logger.error("[HTTP] No GROUND_CONTROL_URL configured – dropping telemetry")
+        return
+
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(f"{os.getenv('GROUND_CONTROL_URL')}/update-vessel", json=payload)
+    except Exception as exc:
+        logger.error(f"[HTTP] Ground station unavailable: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Basket helpers
+# ---------------------------------------------------------------------------
+def _cancel_close_timer() -> None:
+    global _basket_close_timer
+    with _basket_lock:
+        if _basket_close_timer and _basket_close_timer.is_alive():
+            _basket_close_timer.cancel()
+            _basket_close_timer = None
+
+
+def _schedule_basket_close(delay: float = BASKET_OPEN_DURATION_S) -> None:
+    """Open the basket now and schedule an automatic close after `delay` seconds."""
+    global TRASH_COLLECTED_COUNT
+    global _basket_close_timer
+
+    with _basket_lock:
+        if _basket_close_timer and _basket_close_timer.is_alive():
+            _basket_close_timer.cancel()
+            _basket_close_timer = None
+
+    ok = arduino.send_command("OPEN_BASKET")
+    if not ok:
+        logger.warning("[BASKET] WARNING — OPEN_BASKET could not be sent")
+        return
+
+    logger.info(f"[BASKET] Opened — will auto-close in {delay}s")
+
+    def _do_close():
+        global TRASH_COLLECTED_COUNT
+        TRASH_COLLECTED_COUNT += 1
+
+        # FIX: Safely trigger state machine rather than hacking the private queue
+        if TRASH_COLLECTED_COUNT >= 30:
+            logger.info("[AUTO] Basket full (30 items) — triggering return home")
+            mission.request_return_home()
+
+        arduino.send_command("CLOSE_BASKET")
+        logger.info("[BASKET] Auto-closed after collection delay")
+
+    with _basket_lock:
+        _basket_close_timer = threading.Timer(delay, _do_close)
+        _basket_close_timer.daemon = True
+        _basket_close_timer.start()
 
 
 # ---------------------------------------------------------------------------
@@ -35,21 +108,20 @@ GROUND_STATION_URL = os.getenv('GROUND_CONTROL_URL')   # your laptop's IP
 # ---------------------------------------------------------------------------
 _camera = None
 
-
 def init_camera() -> None:
     global _camera
     for index in range(3):
-        print(f"[CAMERA] Scanning index {index}...")
+        logger.info(f"[CAMERA] Scanning index {index}...")
         cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             cap.set(cv2.CAP_PROP_FPS,           15)
             _camera = cap
-            print(f"[CAMERA] Online at index {index}")
+            logger.info(f"[CAMERA] Online at index {index}")
             return
         cap.release()
-    print("[CAMERA] No camera found — /video_feed will return empty stream")
+    logger.info("[CAMERA] No camera found — /video_feed will return empty stream")
 
 
 def generate_frames():
@@ -75,41 +147,46 @@ def generate_frames():
 # GPS → Ground-control sync thread
 # ---------------------------------------------------------------------------
 def sync_gps_to_ground() -> None:
-    """Push live GPS position to the ground-control map every 2 s."""
-    print("[SYNC] GPS sync thread started")
+    """Background thread tracking GPS and forwarding full telemetry data."""
+    logger.info("[SYNC] GPS sync thread started")
+
     while True:
         position = gps.get_gps()
+        sensor = arduino.get_arduino()
+
+        # Grab live battery from the onboard Arduino dictionary data structure
+        current_battery = sensor["battery_percent"] if sensor else asv_state["battery"]
+
         if position:
-            try:
-                requests.post(
-                    f"{GROUND_STATION_URL}/update-vessel",
-                    json={"latitude": position["lat"], "longitude": position["lng"]},
-                    timeout=1,
-                )
-            except Exception:
-                print("[SYNC_WARNING] GPS not sync: ground station may be offline — keep going.")
-                pass            # ground station may be offline — keep going
-        print("[GPS_WARNING] GPS module can't get any data")
+            payload = {
+                "latitude":  position["lat"],
+                "longitude": position["lng"],
+                "battery":   current_battery,  # ✅ FIX: Battery payload is now included
+                "speed":  position["speed_ms"],
+            }
+
+            asyncio.run(_post_ground_station(payload))
+
+            mission.update_health(
+                battery_percent=current_battery,
+                gps=(position["lat"], position["lng"], time.time())
+            )
+        else:
+            logger.error("[GPS_WARNING] GPS module can't get any data")
+
         time.sleep(2)
 
 
 # ---------------------------------------------------------------------------
 # Arduino sensor gate helpers
 # ---------------------------------------------------------------------------
-def _send_sensor_cmd(cmd: str) -> None:
-    """
-    Send START_SENSOR or STOP_SENSOR to the Arduino and log the result.
-    Retries once if the serial port is not yet ready — the Arduino reader
-    thread may still be initialising right after arduino.start().
-    """
-    for attempt in range(2):
-        ok = arduino.send_command(cmd)
-        if ok:
-            print(f"[SENSOR GATE] '{cmd}' sent to Arduino")
-            return
-        print(f"[SENSOR GATE] Serial not ready (attempt {attempt + 1}), retrying in 1 s…")
-        time.sleep(1)
-    print(f"[SENSOR GATE] WARNING — could not send '{cmd}' after 2 attempts")
+def _send_sensor_cmd(cmd: str) -> bool:
+    ok = arduino.send_command_with_retry(cmd, retries=5, delay=1.0)
+    if ok:
+        logger.info(f"[SENSOR GATE] '{cmd}' sent to Arduino")
+    else:
+        logger.error(f"[SENSOR GATE] WARNING — could not send '{cmd}' after retries")
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +199,8 @@ def decide_auto_command(
     left: int,
     right: int,
 ) -> str:
-    """
-    Pure function: sensor readings → high-level intent string.
-    All intents are translated to Arduino primitives inside arduino.py.
-    """
     if not trash_detected:
-        print("[AUTO] No trash detected — STOP")
+        logger.info("[AUTO] No trash detected — STOP")
         return "STOP"
 
     front_clear = front > OBSTACLE_DISTANCE
@@ -137,37 +210,37 @@ def decide_auto_command(
 
     if pos == "CENTER":
         if front_clear:
-            print("[AUTO] CENTER + front clear — GO_TRASH")
+            logger.info("[AUTO] CENTER + front clear — GO_TRASH")
             return "GO_TRASH"
-        print("[AUTO] CENTER + front blocked — STOP")
+        logger.info("[AUTO] CENTER + front blocked — STOP")
         return "STOP"
 
     if pos == "LEFT":
         if left_clear or front_clear:
-            print("[AUTO] LEFT + path available — ALIGN_LEFT")
+            logger.info("[AUTO] LEFT + path available — ALIGN_LEFT")
             return "ALIGN_LEFT"
         if right_clear:
-            print("[AUTO] LEFT + left blocked, right open — AVOID_RIGHT")
+            logger.info("[AUTO] LEFT + left blocked, right open — AVOID_RIGHT")
             return "AVOID_RIGHT"
-        print("[AUTO] LEFT + all blocked — STOP")
+        logger.info("[AUTO] LEFT + all blocked — STOP")
         return "STOP"
 
     if pos == "RIGHT":
         if right_clear or front_clear:
-            print("[AUTO] RIGHT + path available — ALIGN_RIGHT")
+            logger.info("[AUTO] RIGHT + path available — ALIGN_RIGHT")
             return "ALIGN_RIGHT"
         if left_clear:
-            print("[AUTO] RIGHT + right blocked, left open — AVOID_LEFT")
+            logger.info("[AUTO] RIGHT + right blocked, left open — AVOID_LEFT")
             return "AVOID_LEFT"
-        print("[AUTO] RIGHT + all blocked — STOP")
+        logger.info("[AUTO] RIGHT + all blocked — STOP")
         return "STOP"
 
-    print(f"[AUTO] Unknown position '{trash_position}' — STOP")
+    logger.info(f"[AUTO] Unknown position '{trash_position}' — STOP")
     return "STOP"
 
 
 # ---------------------------------------------------------------------------
-# Shared ASV state  (last-known; real data overwrites on every tick)
+# Shared ASV state
 # ---------------------------------------------------------------------------
 asv_state: dict = {
     "latitude":     14.6537,
@@ -181,13 +254,40 @@ asv_state: dict = {
     "battery":      100.0,
 }
 
-
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
-
 def _drift(v: float, delta: float, lo: float, hi: float) -> float:
     return round(_clamp(v + random.uniform(-delta, delta), lo, hi), 2)
+
+
+# ─── 1. MODE SCHEMA (Fixed: Removed duplicate definition) ────────────────────
+class ModeRequest(BaseModel):
+    mode: Literal["manual", "autonomous"]
+
+
+# ─── 2. BASKET CONTROL SCHEMA (Fixed: Enforced literal choices) ──────────────
+class BasketRequest(BaseModel):
+    action: Literal["open", "close"]
+
+
+# ─── 3. STEERING & NAVIGATION TELEMETRY ─────────────────────────────────────
+class ControlRequest(BaseModel):
+    command: str = "STOP"  # e.g., "FORWARD", "REVERSE", "LEFT", "RIGHT", "STOP"
+    trash_detected: bool = False
+    # Fixed: Prevented custom string bypasses by locking options via Literal
+    trash_position: Literal["LEFT", "CENTER", "RIGHT"] = "CENTER"
+
+
+# ─── 4. AUTONOMOUS MISSION PARAMETERS ────────────────────────────────────────
+class MissionRequest(BaseModel):
+    action: Literal["start", "stop"] = "start"
+
+    # Field validation bounds ensure coordinates or physics targets don't accept nonsense values
+    bearing: float = Field(default=0.0, ge=0.0, le=360.0)       # Must be between 0° and 360°
+    strip_length: float = Field(default=15.0, gt=0.0)            # Length must be greater than 0
+    strip_spacing: float = Field(default=3.0, gt=0.0)           # Spacing must be greater than 0
+    num_strips: int = Field(default=4, gt=0)
 
 
 # ---------------------------------------------------------------------------
@@ -195,62 +295,53 @@ def _drift(v: float, delta: float, lo: float, hi: float) -> float:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ──────────────────────────────────────────────────────────
+    global http_client
+    http_client = httpx.AsyncClient(timeout=5.0)
+
     arduino.start()
     gps.start()
-    print("[APP] Arduino and GPS readers started")
+    logger.info("[APP] Arduino and GPS readers started")
+    logger.info("[APP] Waiting for Arduino ready signal...")
 
-    # Wait for the Arduino to finish setup() before sending START_SENSOR.
-    # "Setup done" is printed after the 3-second ESC arming delay, so a
-    # blind sleep would race against it. wait_until_ready() blocks until
-    # the reader thread sees that exact line, up to 30 seconds.
-    print("[APP] Waiting for Arduino ready signal...")
     if arduino.wait_until_ready(timeout=30):
-        print("[APP] Arduino ready — sending START_SENSOR")
+        logger.info("[APP] Arduino ready — sending START_SENSOR")
     else:
-        print("[APP] WARNING — Arduino did not signal ready within 30 s, sending START_SENSOR anyway")
-    _send_sensor_cmd("START_SENSOR")
+        logger.warning("[APP] WARNING — Arduino did not signal ready within 30 s, sending anyway")
 
-    threading.Thread(target=sync_gps_to_ground, daemon=True).start()
+    _send_sensor_cmd("START_SENSOR")
+    logger.info("[APP] Waiting for Arduino to confirm sensor gate open...")
+
+    if arduino.wait_until_sensor_active(timeout=10):
+        logger.info("[APP] Sensor gate confirmed OPEN — motors and basket ready")
+    else:
+        logger.warning(
+            "[APP] WARNING — Did not receive ACK START_SENSOR within 10 s. "
+            "Commands may be dropped. Check serial connection."
+        )
+
+    threading.Thread(
+        target=sync_gps_to_ground,
+        daemon=True,
+        name="gps-sync-thread",
+    ).start()
     init_camera()
 
-    yield  # ←── server is running
+    yield
 
-    # ── Shutdown ─────────────────────────────────────────────────────────
-    # Tell the Arduino to stop collecting and safe the motors before the
-    # serial port is closed by the OS.
-    print("[APP] Shutdown initiated — stopping Arduino sensors")
+    logger.info("[APP] Shutdown — cancelling basket timer and stopping sensors")
+    _cancel_close_timer()
+    arduino.send_command("CLOSE_BASKET")
+    time.sleep(0.2)
     _send_sensor_cmd("STOP_SENSOR")
-    time.sleep(0.5)          # give the Arduino time to echo the ACK
-
+    time.sleep(0.5)
     if _camera:
         _camera.release()
-    print("[APP] Lifespan teardown complete")
+    if http_client is not None:
+        await http_client.aclose()
+    logger.info("[APP] Lifespan teardown complete")
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-class ControlRequest(BaseModel):
-    command:        str  = "STOP"
-    # AUTO mode: ground control MUST supply these two fields
-    trash_detected: bool = False
-    trash_position: str  = "CENTER"   # "LEFT" | "CENTER" | "RIGHT"
-
-
-class MissionRequest(BaseModel):
-    action:         str   = "start"  # "start" | "stop"
-    bearing:        float = 0.0      # compass direction across the river (0–360°)
-    strip_length:   float = 15.0     # metres across per strip
-    strip_spacing:  float = 3.0      # metres between strips (≤ camera FOV width)
-    num_strips:     int   = 4        # number of strips to cover
-
-
-class ModeRequest(BaseModel):
-    mode: str  # "manual" | "autonomous"
 
 
 # ---------------------------------------------------------------------------
@@ -260,49 +351,66 @@ class ModeRequest(BaseModel):
 def get_root():
     return {"message": "ASV API is online"}
 
-
-# ── Mode gate ─────────────────────────────────────────────────────────────────
 @app.post("/mode")
 def set_mode(body: ModeRequest):
-    """
-    Called by the phone controller whenever the user toggles manual / autonomous.
-    This gates /debug-command and /control so the two callers never fight:
-      manual     → phone controls motors, laptop AUTO packets are ignored
-      autonomous → laptop AUTO packets control motors, phone commands are ignored
-    """
     global server_mode
     if body.mode not in ("manual", "autonomous"):
         return JSONResponse(status_code=400, content={"error": "mode must be 'manual' or 'autonomous'"})
     server_mode = body.mode
-    print(f"[MODE] Server mode → {server_mode}")
+    logger.info(f"[MODE] Server mode → {server_mode}")
     return {"status": "ok", "mode": server_mode}
-
 
 @app.get("/mode")
 def get_mode():
     return {"mode": server_mode}
 
+@app.post("/basket")
+def control_basket(body: BasketRequest):
+    action = body.action.lower()
+    if action == "open":
+        _schedule_basket_close()
+        sensor = arduino.get_arduino()
+        return {
+            "status":       "opening",
+            "basket_state": sensor["basket_state"] if sensor else "UNKNOWN",
+        }
+    if action == "close":
+        _cancel_close_timer()
+        ok = arduino.send_command("CLOSE_BASKET")
+        sensor = arduino.get_arduino()
+        return {
+            "status":       "closing" if ok else "serial_unavailable",
+            "basket_state": sensor["basket_state"] if sensor else "UNKNOWN",
+        }
+    return JSONResponse(status_code=400, content={"error": "action must be 'open' or 'close'"})
 
-# ── Manual override ───────────────────────────────────────────────────────
+@app.get("/basket")
+def get_basket_state():
+    sensor = arduino.get_arduino()
+    return {
+        "basket_state":  sensor["basket_state"] if sensor else "UNKNOWN",
+        "sensor_active": arduino.sensor_active,
+    }
+
 @app.get("/debug-command")
 def debug_command(cmd: str = Query(...)):
-    """
-    Manual motor override — used exclusively by the phone controller.
-    Dropped when server is in autonomous mode so the phone can't accidentally
-    fight the laptop's AUTO loop.
-    """
     if server_mode != "manual":
-        print(f"[DEBUG] Dropped '{cmd}' — server is in autonomous mode")
+        logger.info(f"[DEBUG] Dropped '{cmd}' — server is in autonomous mode")
         return {"status": "dropped", "reason": "server is in autonomous mode"}
 
+    if not arduino.sensor_active:
+        logger.error(f"[DEBUG] WARNING — sensor gate not open, '{cmd}' may be ignored by Arduino")
+
     cmd = cmd.upper()
-    print(f"[DEBUG] Manual command: '{cmd}'")
+    logger.info(f"[DEBUG] Manual command: '{cmd}'")
     result = arduino.send_command(cmd)
     sensor = arduino.get_arduino()
     return {
-        "sent":        cmd,
-        "serial_ok":   result,
-        "motor_state": sensor["motor_state"] if sensor else "NO_SENSOR_DATA",
+        "sent":          cmd,
+        "serial_ok":     result,
+        "sensor_active": arduino.sensor_active,
+        "motor_state":   sensor["motor_state"]  if sensor else "NO_SENSOR_DATA",
+        "basket_state":  sensor["basket_state"] if sensor else "NO_SENSOR_DATA",
         "lidar": {
             "front": sensor["front_distance"] if sensor else -1,
             "left":  sensor["left_distance"]  if sensor else -1,
@@ -310,8 +418,6 @@ def debug_command(cmd: str = Query(...)):
         },
     }
 
-
-# ── Camera stream ─────────────────────────────────────────────────────────
 @app.get("/video_feed")
 def video_feed():
     return StreamingResponse(
@@ -319,80 +425,88 @@ def video_feed():
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
-
-# ── Mission control ───────────────────────────────────────────────────────
 @app.post("/mission")
 def control_mission(body: MissionRequest):
-    pos = gps.get_gps()
-    if body.action == "start":
-        if not pos:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "No GPS fix yet — cannot start mission"},
-            )
-        mission.start_survey(
-            pos["lat"],
-            pos["lng"],
-            bearing       = body.bearing,
-            strip_length  = body.strip_length,
-            strip_spacing = body.strip_spacing,
-            num_strips    = body.num_strips,
-        )
-        status = mission.status()
-        return {
-            "status":     "survey started",
-            "waypoints":  status["waypoints"],
-            "total_wp":   status["total_wp"],
-            "coverage_m2": body.strip_length * (body.strip_spacing * (body.num_strips - 1)),
-        }
-    mission.stop()
-    return {"status": "mission stopped"}
+    global server_mode
+    action = body.action.lower()
 
+    if action == "start":
+        # 1. Fetch current GPS coordinates to seed path planning safely
+        position = gps.get_gps()
+        if not position:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Cannot start mission: No valid GPS fix available."}
+            )
+
+        # 2. Start the internal path planning and state changes
+        mission.start_survey(
+            lat=position["lat"],
+            lon=position["lng"],
+            bearing=body.bearing
+        )
+
+        # 🪛 FIX: Force system operation mode to autonomous so control_rover runs tick()
+        server_mode = "autonomous"
+        logger.info(f"[MISSION] System forced to '{server_mode}' mode for autonomous survey orchestration.")
+
+        return {
+            "status": "success",
+            "message": "Survey route mapped and autonomous mode engaged.",
+            "mission_state": mission.status()
+        }
+
+    elif action == "stop":
+        # Stop the mission manager
+        mission.stop()
+
+        # Fallback system safely to manual mode upon abandonment
+        server_mode = "manual"
+        arduino.send_command("STOP")
+        logger.info(f"[MISSION] Survey abandoned. System mode restored to '{server_mode}'.")
+
+        return {
+            "status": "success",
+            "message": "Mission terminated. Control restored to manual mode.",
+            "mission_state": mission.status()
+        }
+
+    return JSONResponse(status_code=400, content={"error": f"Invalid mission action '{body.action}'"})
 
 @app.get("/mission/status")
 def get_mission_status():
     return mission.status()
 
-
-# ── Return to home ───────────────────────────────────────────────────────────
 @app.post("/return-home")
 def return_home():
-    """
-    Abort the current mission and navigate back to the launch GPS position.
-    Requires that at least one survey has been started so a home position exists.
-    """
-    result = mission.return_home()
-    if not result["ok"]:
-        return JSONResponse(
-            status_code=400,
-            content={"error": result["error"]},
-        )
-    lat, lon = result["home"]
-    print(f"[RTH] Returning to home: ({lat:.6f}, {lon:.6f})")
-    return {
-        "status":   "returning",
-        "home_lat": lat,
-        "home_lon": lon,
-    }
+    """Triggers the proper sequence inside MissionManager."""
+    # ✅ FIX: Changed from .return_home() to matching .request_return_home() method
+    mission.request_return_home()
+
+    # Safely extract target from mission context or fallback
+    pos = gps.get_gps()
+    home_lat, home_lon = mission.context.get("home_gps") or (pos["lat"] if pos else (0.0, 0.0))
+
+    logger.info(f"[RTH] Returning to home site coordinates: ({home_lat:.6f}, {home_lon:.6f})")
+    return {"status": "returning", "home_lat": home_lat, "home_lon": home_lon}
 
 
-# ── Telemetry endpoints ───────────────────────────────────────────────────
 @app.get("/live-monitoring")
-def get_live_monitoring():
+async def get_live_monitoring():
     sensor   = arduino.get_arduino()
     position = gps.get_gps()
 
     asv_state["battery"] = (
         sensor["battery_percent"]
         if sensor
-        else _drift(asv_state["battery"], 2, 80, 100)
+        else logger.warning("[LIVE-MONITORING] No Battery data yet — using last known state")
     )
     if position:
         asv_state["latitude"]  = position["lat"]
         asv_state["longitude"] = position["lng"]
+        asv_state["speed"]     = position["speed_ms"]
     else:
-        asv_state["latitude"]  = _drift(asv_state["latitude"],  0.05, 14.60, 14.70)
-        asv_state["longitude"] = _drift(asv_state["longitude"], 0.05, 121.00, 121.10)
+        logger.warning("[LIVE-MONITORING] No GPS data yet — using last known state")
 
     asv_state["plastics"]     = _drift(asv_state["plastics"],     1, 21, 45)
     asv_state["non_plastics"] = _drift(asv_state["non_plastics"], 1, 21, 45)
@@ -407,7 +521,6 @@ def get_live_monitoring():
         "longitude":      asv_state["longitude"],
     }
 
-
 @app.get("/control-panel")
 def get_control_panel():
     sensor   = arduino.get_arduino()
@@ -418,27 +531,25 @@ def get_control_panel():
         asv_state["roll"]    = sensor["roll"]
         asv_state["battery"] = sensor["battery_percent"]
     else:
-        print("[control-panel] No Arduino data yet — using last known state")
+        logger.warning("[CONTROL_PANEL] No Arduino data yet — using last known state")
 
     if position:
         asv_state["latitude"]  = position["lat"]
         asv_state["longitude"] = position["lng"]
+        asv_state["speed"]     = position["speed_ms"]
     else:
-        print("[control-panel] No GPS fix yet — using last known state")
-
-    asv_state["speed"]   = _drift(asv_state["speed"],   2,  2, 5)
-    asv_state["heading"] = _drift(asv_state["heading"], 5,  0, 360)
+        logger.warning("[CONTROL_PANEL] No GPS fix yet — using last known state")
 
     return {
-        "latitude":  asv_state["latitude"],
-        "longitude": asv_state["longitude"],
-        "speed":     asv_state["speed"],
-        "pitch":     asv_state["pitch"],
-        "roll":      asv_state["roll"],
-        "heading":   asv_state["heading"],
-        "battery":   asv_state["battery"],
+        "latitude":     asv_state["latitude"],
+        "longitude":    asv_state["longitude"],
+        "speed":        asv_state["speed"],
+        "pitch":        asv_state["pitch"],
+        "roll":         asv_state["roll"],
+        "heading":      asv_state["heading"],
+        "battery":      asv_state["battery"],
+        "basket_state": sensor["basket_state"] if sensor else "UNKNOWN",
     }
-
 
 @app.get("/gps")
 def get_gps_route():
@@ -447,52 +558,38 @@ def get_gps_route():
         return {"status": True, "latitude": position["lat"], "longitude": position["lng"]}
     return {"status": False, "response": "No GPS fix yet"}
 
-
 @app.get("/sensor-raw")
 def get_sensor_raw():
     return {
-        "arduino": arduino.get_arduino() or "No data yet",
-        "gps":     gps.get_gps()         or "No fix yet",
+        "arduino":       arduino.get_arduino() or "No data yet",
+        "gps":           gps.get_gps()         or "No fix yet",
+        "sensor_active": arduino.sensor_active,
     }
 
-
-# ── Main control endpoint ─────────────────────────────────────────────────
 @app.post("/control")
 def control_rover(body: ControlRequest):
-    """
-    Called by the ground-control laptop's AUTO loop every ~500 ms.
-    Also accepts direct FORWARD/LEFT/RIGHT/STOP for other callers.
-
-    Mode gate
-    ─────────
-    When server_mode == "manual" (phone is in manual), AUTO packets from the
-    laptop are silently dropped and the phone's /debug-command calls win.
-    When server_mode == "autonomous", this route executes normally.
-
-    AUTO mode flow
-    ──────────────
-    1. Read latest lidar distances from Arduino (cm).
-    2. Read GPS position.
-    3. Let MissionManager.tick() decide if there is an active mission.
-    4. Fallback: decide_auto_command() from YOLO trash position hint.
-    5. Translate final intent → Arduino primitive via arduino.send_command().
-    """
     command = body.command.upper()
 
-    # Gate: drop AUTO packets when the phone has taken manual control
     if command == "AUTO" and server_mode != "autonomous":
-        print("[CONTROL] Dropped AUTO packet — server is in manual mode")
+        logger.info("[CONTROL] Dropped AUTO packet — server is in manual mode")
         return {"status": "dropped", "reason": "server is in manual mode"}
+
+    if not arduino.sensor_active:
+        logger.error("[CONTROL] WARNING — sensor gate not confirmed open")
 
     if command == "AUTO":
         sensor = arduino.get_arduino()
-        # Use 999 (very far) as safe fallback so obstacle logic stays clear
-        # when the sensor hasn't sent data yet.
         front = sensor["front_distance"] if sensor else 999
         left  = sensor["left_distance"]  if sensor else 999
         right = sensor["right_distance"] if sensor else 999
         pos   = gps.get_gps()
 
+        if sensor:
+            mission.update_health(
+                battery_percent = sensor["battery_percent"],
+            )
+
+        # Always tick the mission manager for health and critical obstacle avoidance
         mission_cmd = mission.tick(
             current_lat    = pos["lat"]  if pos else asv_state["latitude"],
             current_lon    = pos["lng"]  if pos else asv_state["longitude"],
@@ -503,33 +600,44 @@ def control_rover(body: ControlRequest):
             trash_position = body.trash_position,
         )
 
-        # mission_cmd is None when mission is IDLE or handing off to trash logic
-        command = mission_cmd if mission_cmd else decide_auto_command(
-            body.trash_detected, body.trash_position, front, left, right
-        )
+        # FIX: Ensure trash collection overrides standard waypoint surveying
+        if body.trash_detected:
+            # Yield to the server's native trash commands (GO_TRASH, ALIGN_LEFT)
+            command = decide_auto_command(
+                body.trash_detected, body.trash_position, front, left, right
+            )
+        else:
+            # Follow survey path or obstacle avoidance
+            command = mission_cmd if mission_cmd else decide_auto_command(
+                body.trash_detected, body.trash_position, front, left, right
+            )
 
-    print(f"[CONTROL] Dispatching: {command}")
+    # # Open basket when the ASV is moving directly toward centred trash
+    # if command == "GO_TRASH":
+    #     _schedule_basket_close()
 
+    logger.info(f"[CONTROL] Dispatching: {command}")
     serial_ok = arduino.send_command(command)
 
-    # FIX-1: never return 500 for a serial issue — ground control must
-    # keep its loop alive regardless.
     if not serial_ok:
-        print(f"[CONTROL] Serial not ready — command '{command}' was not sent")
+        logger.error(f"[CONTROL] Serial not ready — command '{command}' was not sent")
         return {
-            "status":      "serial_unavailable",
-            "intent":      command,
-            "arduino_cmd": command,
-            "motor_state": "UNKNOWN",
-            "lidar":       {"front": 999, "left": 999, "right": 999},
+            "status":        "serial_unavailable",
+            "intent":        command,
+            "arduino_cmd":   command,
+            "sensor_active": arduino.sensor_active,
+            "motor_state":   "UNKNOWN",
+            "lidar":         {"front": 999, "left": 999, "right": 999},
         }
 
     sensor = arduino.get_arduino()
     return {
-        "status":      "success",
-        "intent":      command,
-        "arduino_cmd": command,
-        "motor_state": sensor["motor_state"]    if sensor else "UNKNOWN",
+        "status":        "success",
+        "intent":        command,
+        "arduino_cmd":   command,
+        "sensor_active": arduino.sensor_active,
+        "motor_state":   sensor["motor_state"]  if sensor else "UNKNOWN",
+        "basket_state":  sensor["basket_state"] if sensor else "UNKNOWN",
         "lidar": {
             "front": sensor["front_distance"] if sensor else 999,
             "left":  sensor["left_distance"]  if sensor else 999,
@@ -537,10 +645,13 @@ def control_rover(body: ControlRequest):
         },
     }
 
-
 @app.get("/test")
 def get_test():
-    return {"arduino": arduino.get_arduino(), "gps": gps.get_gps()}
+    return {
+        "arduino":       arduino.get_arduino(),
+        "gps":           gps.get_gps(),
+        "sensor_active": arduino.sensor_active,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -550,11 +661,10 @@ if __name__ == "__main__":
     try:
         uvicorn.run(app, host="0.0.0.0", port=5000)
     finally:
-        # Last-resort STOP_SENSOR in case the lifespan teardown was skipped
-        # (e.g. the process was killed before the async context could exit).
-        # arduino.send_command is safe to call here — the serial thread is
-        # still alive until the process fully exits.
-        print("[STOP] Server exited — sending final STOP_SENSOR to Arduino")
+        logger.info("[STOP] Server exited — sending final CLOSE_BASKET + STOP_SENSOR")
+        _cancel_close_timer()
+        arduino.send_command("CLOSE_BASKET")
+        time.sleep(0.2)
         arduino.send_command("STOP_SENSOR")
         time.sleep(0.3)
-        print("[STOP] Shutdown complete")
+        logger.info("[STOP] Shutdown complete")
