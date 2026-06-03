@@ -344,6 +344,7 @@ def generate_annotated_frames():
                     print(
                         f"too small"
                         f"W:{box_width} H:{box_height} A:{box_area}")
+<<<<<<< HEAD
                     continue
 
                 if box_area > MAX_BOX_AREA:
@@ -362,6 +363,26 @@ def generate_annotated_frames():
                     "area": box_area
                 })
 
+=======
+                    continue
+                    
+                if box_area > MAX_BOX_AREA:
+                    print(
+                        f"too large"
+                        f"W:{box_width} H:{box_height} A:{box_area}")
+                    continue
+
+                detection_list.append({
+                    "id": obj_id,
+                    "cx": cx,
+                    "cy": cy,
+                    "box": box,
+                    "width": box_width,
+                    "height": box_height,
+                    "area": box_area
+                })
+
+>>>>>>> dfd12b68bd416601c4e1fbd69f999267f32cb13f
             if len(detection_list) == 0:
                 latest_detections = []
                 send_auto_data(False, "CENTER")
