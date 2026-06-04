@@ -76,4 +76,5 @@ coverage/
 # Misc
 # =========================
 app-example
+.ropeproject
 sessions*
