@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------------------
 # Configuration constants
 # ----------------------------------------------------------------------
-MAX_OBSTACLE_DISTANCE_M = 0.50         # Slightly increased to compensate for servo panning delays
+MAX_OBSTACLE_DISTANCE_CM = 50         # Slightly increased to compensate for servo panning delays
 BATTERY_LOW_THRESHOLD   = 15.0         # %
 GPS_MAX_AGE_SECONDS     = 30
 TASK_RETRY_LIMIT        = 3
@@ -75,7 +75,7 @@ class MissionManager:
             self.state = MissionState.SURVEYING
             logger.info("[MISSION] Survey started at (%.6f, %.6f) — %d waypoints locked.", lat, lon, len(self.context["waypoints"]))
 
-    def update_health(self, battery_percent: float = None, gps: tuple = None) -> None:
+    def update_health(self, battery_percent: Optional[float] = None, gps: Optional[tuple] = None) -> None:
         with self._lock:
             if battery_percent is not None:
                 self.context["battery_percent"] = battery_percent
@@ -166,56 +166,81 @@ class MissionManager:
         trash_position: str,
     ) -> Optional[str]:
         with self._lock:
-            # 0️⃣ Fail-safe guard
-            self._perform_health_check()
-            if self.state == MissionState.ABORTED:
-                return "STOP"
-
-            if self.state == MissionState.IDLE:
-                return None
-
-            # 1️⃣ Intercept State Transitions for Trash Target Tracking
-            if trash_detected and self.state == MissionState.SURVEYING:
-                self.state = MissionState.COLLECTING
-                while not self._task_queue.empty(): self._task_queue.get() # Clear active waypoint task
-                logger.info("[STATE] Trash locked! Switching from SURVEYING to COLLECTING.")
-            elif not trash_detected and self.state == MissionState.COLLECTING:
-                self.state = MissionState.SURVEYING
-                while not self._task_queue.empty(): self._task_queue.get()
-                logger.info("[STATE] Target lost or collected. Returning to SURVEYING.")
-
-            # 2️⃣ Panning Servo Obstacle Avoidance Routing
-            # Note: treating 0 or lower as an automatic dead-zone sensor exception.
-            if front_cm <= 0 or check_for_obstacles(front_cm / 100.0, threshold=MAX_OBSTACLE_DISTANCE_M):
-                scan = {-45: left_cm, 0: front_cm, 45: right_cm}
-                best = find_clear_path(scan)
-
-                # FIX: Explicit angular string mapping prevents turning right when front is clear
-                if best == -45:
-                    logger.warning("[AVOIDANCE] Obstacle! Panning servo indicates escaping LEFT.")
-                    return "LEFT"
-                elif best == 45:
-                    logger.warning("[AVOIDANCE] Obstacle! Panning servo indicates escaping RIGHT.")
-                    return "RIGHT"
-                else:
-                    logger.info("[AVOIDANCE] Front obstacle cleared during sweep loop. Pushing FORWARD.")
-                    return "FORWARD"
-
-            # 3️⃣ Queue Handler
-            if self._task_queue.empty():
-                if self.state == MissionState.SURVEYING:
-                    self._enqueue_task(self._task_follow_waypoint, priority=20)
-                elif self.state == MissionState.COLLECTING:
-                    self._enqueue_task(self._task_collect_trash, priority=30)
-                elif self.state == MissionState.RETURNING:
-                    self._enqueue_task(self._task_return_home, priority=40)
-
-            # 4️⃣ Execution
+            if (guard := self._check_terminal_state()):
+                return guard
+            self._update_state_from_detection(trash_detected)
+            if (avoidance := self._resolve_obstacle(front_cm, left_cm, right_cm)):
+                return avoidance
+            self._ensure_task_queued()
             intent = self._run_next_task(
                 current_lat, current_lon, front_cm, left_cm, right_cm,
                 trash_detected, trash_position,
             )
             return intent if intent else "FORWARD"
+
+
+    def _check_terminal_state(self) -> Optional[str]:
+        """Returns a command if the mission is in a terminal/idle state, else None."""
+        self._perform_health_check()
+        if self.state == MissionState.ABORTED:
+            return "STOP"
+        if self.state == MissionState.IDLE:
+            return None
+        return None  # Active state — proceed normally
+
+
+    def _update_state_from_detection(self, trash_detected: bool) -> None:
+        """Handles SURVEYING <-> COLLECTING transitions based on trash visibility."""
+        if trash_detected and self.state == MissionState.SURVEYING:
+            self.state = MissionState.COLLECTING
+            self._clear_task_queue()
+            logger.info("[STATE] Trash locked! Switching from SURVEYING to COLLECTING.")
+        elif not trash_detected and self.state == MissionState.COLLECTING:
+            self.state = MissionState.SURVEYING
+            self._clear_task_queue()
+            logger.info("[STATE] Target lost or collected. Returning to SURVEYING.")
+
+
+    def _resolve_obstacle(
+        self, front_cm: int, left_cm: int, right_cm: int
+    ) -> Optional[str]:
+        """Returns an avoidance command if an obstacle is detected, else None."""
+        if front_cm > 0 and not check_for_obstacles(front_cm, MAX_OBSTACLE_DISTANCE_CM):
+            return None
+        scan = {-45: left_cm, 0: front_cm, 45: right_cm}
+        best = find_clear_path(scan)
+        match best:
+            case "LEFT":
+                logger.info("[AVOIDANCE] Clear path found. Going LEFT (Clearance: %d cm)", left_cm)
+                return "LEFT"
+            case "RIGHT":
+                logger.info("[AVOIDANCE] Clear path found. Evading RIGHT (Clearance: %d cm)", right_cm)
+                return "RIGHT"
+            case "STOP":
+                logger.error("[AVOIDANCE] All paths blocked! Commanding STOP.")
+                return "STOP"
+            case _:
+                logger.info("[AVOIDANCE] Front obstacle cleared during sweep loop. Pushing FORWARD.")
+                return "FORWARD"
+
+
+    def _ensure_task_queued(self) -> None:
+        """Enqueues the appropriate task for the current state if the queue is empty."""
+        if not self._task_queue.empty():
+            return
+        match self.state:
+            case MissionState.SURVEYING:
+                self._enqueue_task(self._task_follow_waypoint, priority=20)
+            case MissionState.COLLECTING:
+                self._enqueue_task(self._task_collect_trash, priority=30)
+            case MissionState.RETURNING:
+                self._enqueue_task(self._task_return_home, priority=40)
+
+
+    def _clear_task_queue(self) -> None:
+        """Drains the task queue."""
+        while not self._task_queue.empty():
+            self._task_queue.get()
 
     # ----------------------------------------------------------------------
     # Task Workers
@@ -243,7 +268,7 @@ class MissionManager:
         elif bearing > 20: return "RIGHT"
         return "FORWARD"
 
-    def _task_collect_trash(self, current_lat: float, current_lon: float, front_cm: int, left_cm: int, right_cm: int, trash_detected: bool, trash_position: str) -> Optional[str]:
+    def _task_collect_trash(self,trash_position: str) -> Optional[str]:
         # State shifting handles the fallback mechanics now
         if trash_position == "LEFT":    return "LEFT"
         elif trash_position == "RIGHT": return "RIGHT"

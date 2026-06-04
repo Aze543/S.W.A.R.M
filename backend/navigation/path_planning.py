@@ -91,18 +91,3 @@ class PathPlanner:
         )
 
         return waypoints
-
-    # ------------------------------------------------------------------ #
-    # Return-to-home path                                                #
-    # ------------------------------------------------------------------ #
-
-    def generate_return_path(
-        self,
-        home_lat: float,
-        home_lon: float,
-    ) -> List[Tuple[float, float]]:
-        """
-        Returns a single-waypoint path pointing at the home position.
-        """
-        logger.info("[PATH_PLANNER] Return-to-home path → (%.6f, %.6f)", home_lat, home_lon)
-        return [(home_lat, home_lon)]
