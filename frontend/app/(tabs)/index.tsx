@@ -10,6 +10,8 @@
  * FIX 3: Resolved the Alert Spamming bug. The heavy rain notification now only
  * triggers once when the threshold is crossed instead of every second.
  * FIX 4: Cleaned up TypeScript style casting warnings (removed 'as any').
+ * FIX 5: Fallback GPS coordinates removed. Weather fetch is skipped when backend
+ * is offline, and a descriptive placeholder is shown instead of nothing.
  */
 
 import { StatusBar } from "expo-status-bar";
@@ -217,6 +219,7 @@ export default function LiveMonitoring() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [weather, setWeather] = useState<WeatherData | null>(null);
+  const [gpsAvailable, setGpsAvailable] = useState(false);
   const [gpsHeading, setGpsHeading] = useState<number | null>(null);
 
   // UseRefs to bypass interval thrashing and state staleness
@@ -232,8 +235,9 @@ export default function LiveMonitoring() {
   // ─── Core Polling Engine ────────────────────────────────────────────────
 
   const fetchAll = useCallback(async () => {
-    let currentLat = 14.85; // Default fallback coordinates
-    let currentLon = 120.97;
+    // No fallback coordinates — null means GPS is genuinely unavailable
+    let currentLat: number | null = null;
+    let currentLon: number | null = null;
 
     // 1. High-Frequency Pi Telemetry Loop (Runs every 1 second)
     try {
@@ -248,6 +252,7 @@ export default function LiveMonitoring() {
 
       currentLat = json.latitude;
       currentLon = json.longitude;
+      setGpsAvailable(true);
 
       if (misRes.ok) {
         setMission(await misRes.json());
@@ -285,8 +290,11 @@ export default function LiveMonitoring() {
       } else {
         prevGps.current = cur;
       }
-    } catch (err: any) {
-      setError(err.message ?? "Failed to fetch telemetry");
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Failed to fetch telemetry";
+      setError(message);
+      setGpsAvailable(false);
     } finally {
       setLoading(false);
     }
@@ -300,8 +308,13 @@ export default function LiveMonitoring() {
     }
 
     // 3. Low-Frequency Weather Loop (Safely throttled to 30 minutes)
+    // Skipped entirely when GPS coordinates are unavailable
     const nowTimestamp = Date.now();
-    if (nowTimestamp - lastWeatherFetchTime.current >= WEATHER_POLL_MS) {
+    if (
+      currentLat !== null &&
+      currentLon !== null &&
+      nowTimestamp - lastWeatherFetchTime.current >= WEATHER_POLL_MS
+    ) {
       try {
         const wData = await fetchWeather(currentLat, currentLon);
         if (wData) {
@@ -355,7 +368,110 @@ export default function LiveMonitoring() {
   const progressWidth: DimensionValue = `${Math.round(((mission?.current_wp ?? 0) / (mission?.total_wp || 1)) * 100)}%`;
   const batteryWidth: DimensionValue = `${battery}%`;
   const binWidth: DimensionValue = `${binPct}%`;
-  //
+
+  // ─── Weather Widget Renderer ──────────────────────────────────────────────
+
+  const renderWeatherWidget = () => {
+    // Backend offline — GPS unavailable, cannot fetch weather
+    if (!gpsAvailable) {
+      return (
+        <View className="flex-row items-center gap-3 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 mb-3">
+          <Text className="text-xl">📡</Text>
+          <View className="flex-1">
+            <Text className="text-slate-300 text-xs font-bold">
+              Weather Unavailable
+            </Text>
+            <Text className="text-slate-500 text-[10px] mt-0.5">
+              GPS data required — waiting for backend connection.
+            </Text>
+          </View>
+        </View>
+      );
+    }
+
+    // GPS is available but weather hasn't been fetched yet (first 30-min window)
+    if (!weather) {
+      return (
+        <View className="flex-row items-center gap-3 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 mb-3">
+          <Text className="text-xl">🌐</Text>
+          <View className="flex-1">
+            <Text className="text-slate-300 text-xs font-bold">
+              Fetching Weather...
+            </Text>
+            <Text className="text-slate-500 text-[10px] mt-0.5">
+              Waiting for first weather poll.
+            </Text>
+          </View>
+        </View>
+      );
+    }
+
+    // Weather data is ready — render the full widget
+    const wx = decodeWeather(weather.weathercode);
+    const isRain = wx.severity === "danger";
+    const isCaution = wx.severity === "caution";
+
+    return (
+      <>
+        <View
+          className={`flex-row items-center justify-between rounded-xl px-4 py-2.5 mb-3 border ${
+            isRain
+              ? "bg-red-950/60 border-red-800/60"
+              : isCaution
+                ? "bg-yellow-950/60 border-yellow-800/60"
+                : "bg-slate-800 border-slate-700"
+          }`}
+        >
+          <View className="flex-row items-center gap-3">
+            <Text className="text-2xl">{wx.icon}</Text>
+            <View>
+              <Text
+                className={`text-xs font-bold ${
+                  isRain
+                    ? "text-red-300"
+                    : isCaution
+                      ? "text-yellow-300"
+                      : "text-white"
+                }`}
+              >
+                {wx.label}
+              </Text>
+              <Text className="text-slate-500 text-[10px]">
+                {weather.temperature.toFixed(0)}°C ·{" "}
+                {weather.windspeed.toFixed(0)} km/h wind
+              </Text>
+            </View>
+          </View>
+          <View className="items-end">
+            <Text
+              className={`text-xs font-bold ${
+                weather.precipProb >= 50 ? "text-red-400" : "text-slate-400"
+              }`}
+            >
+              💧 {weather.precipProb}%
+            </Text>
+            <Text className="text-slate-600 text-[10px]">precip now</Text>
+          </View>
+        </View>
+
+        {weather.next3hMaxPrecip >= 50 && weather.next3hMaxPrecip < 80 && (
+          <View className="bg-yellow-950/60 border border-yellow-700/60 rounded-xl px-4 py-3 mb-3 flex-row items-center gap-3">
+            <Text className="text-xl">⚠️</Text>
+            <View className="flex-1">
+              <Text className="text-yellow-300 text-xs font-bold">
+                Rain likely within 3 hours
+              </Text>
+              <Text className="text-yellow-600 text-[10px] mt-0.5">
+                {weather.next3hMaxPrecip}% precipitation — monitor conditions
+                before deploying.
+              </Text>
+            </View>
+          </View>
+        )}
+      </>
+    );
+  };
+
   return (
     <SafeAreaView className="flex-1 bg-slate-900 p-5">
       <StatusBar style="light" />
@@ -378,74 +494,7 @@ export default function LiveMonitoring() {
       </View>
 
       {/* ── Weather Widget ───────────────────────────────────────────────── */}
-      {weather &&
-        (() => {
-          const wx = decodeWeather(weather.weathercode);
-          const isRain = wx.severity === "danger";
-          const isCaution = wx.severity === "caution";
-          return (
-            <>
-              <View
-                className={`flex-row items-center justify-between rounded-xl px-4 py-2.5 mb-3 border ${
-                  isRain
-                    ? "bg-red-950/60 border-red-800/60"
-                    : isCaution
-                      ? "bg-yellow-950/60 border-yellow-800/60"
-                      : "bg-slate-800 border-slate-700"
-                }`}
-              >
-                <View className="flex-row items-center gap-3">
-                  <Text className="text-2xl">{wx.icon}</Text>
-                  <View>
-                    <Text
-                      className={`text-xs font-bold ${
-                        isRain
-                          ? "text-red-300"
-                          : isCaution
-                            ? "text-yellow-300"
-                            : "text-white"
-                      }`}
-                    >
-                      {wx.label}
-                    </Text>
-                    <Text className="text-slate-500 text-[10px]">
-                      {weather.temperature.toFixed(0)}°C ·{" "}
-                      {weather.windspeed.toFixed(0)} km/h wind
-                    </Text>
-                  </View>
-                </View>
-                <View className="items-end">
-                  <Text
-                    className={`text-xs font-bold ${
-                      weather.precipProb >= 50
-                        ? "text-red-400"
-                        : "text-slate-400"
-                    }`}
-                  >
-                    💧 {weather.precipProb}%
-                  </Text>
-                  <Text className="text-slate-600 text-[10px]">precip now</Text>
-                </View>
-              </View>
-
-              {weather.next3hMaxPrecip >= 50 &&
-                weather.next3hMaxPrecip < 80 && (
-                  <View className="bg-yellow-950/60 border border-yellow-700/60 rounded-xl px-4 py-3 mb-3 flex-row items-center gap-3">
-                    <Text className="text-xl">⚠️</Text>
-                    <View className="flex-1">
-                      <Text className="text-yellow-300 text-xs font-bold">
-                        Rain likely within 3 hours
-                      </Text>
-                      <Text className="text-yellow-600 text-[10px] mt-0.5">
-                        {weather.next3hMaxPrecip}% precipitation — monitor
-                        conditions before deploying.
-                      </Text>
-                    </View>
-                  </View>
-                )}
-            </>
-          );
-        })()}
+      {renderWeatherWidget()}
 
       {/* ── Battery + Bin Capacity ────────────────────────────────────────── */}
       <View className="flex-row gap-4 mb-4">

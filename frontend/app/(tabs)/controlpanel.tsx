@@ -10,6 +10,8 @@
  * FIX 4: Integrated dataRef to feed accurate live GPS coordinates to the 30-min
  * weather interval, eliminating stale closure errors.
  * FIX 5: Implemented an isMounted flag to prevent state memory leaks across screen switches.
+ * FIX 6: Removed fallback GPS coordinates. Weather fetch is skipped when backend is
+ * offline, and a descriptive placeholder replaces the empty weather widget.
  */
 
 import { StatusBar } from "expo-status-bar";
@@ -216,6 +218,7 @@ export default function ControlPanel() {
   const [serverMode, setServerMode] = useState<string>("---");
   const [lastUpdated, setLastUpdated] = useState("--");
   const [error, setError] = useState<string | null>(null);
+  const [gpsAvailable, setGpsAvailable] = useState(false);
 
   const [missionStatus, setMissionStatus] = useState<MissionStatus | null>(
     null,
@@ -269,6 +272,7 @@ export default function ControlPanel() {
       if (!isMounted.current) return;
 
       setData(json);
+      setGpsAvailable(true);
       setError(null);
       setLastUpdated(new Date().toLocaleTimeString());
 
@@ -309,9 +313,11 @@ export default function ControlPanel() {
       } else {
         prevGps.current = cur;
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
       if (isMounted.current) {
-        setError(err.message ?? "Failed to fetch");
+        const message = err instanceof Error ? err.message : "Failed to fetch";
+        setError(message);
+        setGpsAvailable(false);
       }
     }
   }, []);
@@ -325,9 +331,10 @@ export default function ControlPanel() {
   // ─── Weather Manager (Isolated Safe 30-Minute Cycle) ──────────────────────
   useEffect(() => {
     async function updateWeatherCycle() {
-      // Safely access values through reference points rather than closed scope states
-      const wLat = dataRef.current?.latitude ?? 14.85;
-      const wLon = dataRef.current?.longitude ?? 120.97;
+      // Skip entirely if no real GPS data has arrived yet
+      const wLat = dataRef.current?.latitude ?? null;
+      const wLon = dataRef.current?.longitude ?? null;
+      if (wLat === null || wLon === null) return;
 
       try {
         const wData = await fetchWeather(wLat, wLon);
@@ -407,9 +414,12 @@ export default function ControlPanel() {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`);
       await fetchData();
-    } catch (e: any) {
-      if (isMounted.current)
-        setMissionError(e.message ?? "Failed to start survey");
+    } catch (e: unknown) {
+      if (isMounted.current) {
+        const message =
+          e instanceof Error ? e.message : "Failed to start survey";
+        setMissionError(message);
+      }
     } finally {
       if (isMounted.current) setMissionLoading(false);
     }
@@ -424,9 +434,12 @@ export default function ControlPanel() {
         body: JSON.stringify({ action: "stop" }),
       });
       await fetchData();
-    } catch (e: any) {
-      if (isMounted.current)
-        setMissionError(e.message ?? "Failed to stop survey");
+    } catch (e: unknown) {
+      if (isMounted.current) {
+        const message =
+          e instanceof Error ? e.message : "Failed to stop survey";
+        setMissionError(message);
+      }
     } finally {
       if (isMounted.current) setMissionLoading(false);
     }
@@ -473,9 +486,11 @@ export default function ControlPanel() {
       setSessionSaved(saveJson.filename ?? "session saved");
 
       await fetch(`${LAPTOP_URL}/session/reset`, { method: "POST" });
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (isMounted.current) {
-        setSessionError(e.message ?? "Failed to save session");
+        const message =
+          e instanceof Error ? e.message : "Failed to save session";
+        setSessionError(message);
       }
     } finally {
       if (isMounted.current) setSessionEnding(false);
@@ -577,7 +592,7 @@ export default function ControlPanel() {
             <View className="h-2 bg-slate-700 rounded-full overflow-hidden mt-3">
               <View
                 style={{
-                  width: speedPct as any,
+                  width: speedPct as `${number}%`,
                   height: 8,
                   backgroundColor: "#3b82f6",
                   borderRadius: 9999,
@@ -704,7 +719,7 @@ export default function ControlPanel() {
             <Text className="text-slate-400 text-xs tracking-widest">
               WEATHER CONDITIONS
             </Text>
-            {weatherError && (
+            {weatherError && gpsAvailable && (
               <Text className="text-slate-600 text-[10px]">{weatherError}</Text>
             )}
           </View>
@@ -801,10 +816,24 @@ export default function ControlPanel() {
                 </>
               );
             })()
+          ) : !gpsAvailable ? (
+            // Backend offline — no GPS, cannot fetch weather
+            <View className="flex-row items-center gap-3 py-2">
+              <Text className="text-xl">📡</Text>
+              <View className="flex-1">
+                <Text className="text-slate-300 text-xs font-bold">
+                  Weather Unavailable
+                </Text>
+                <Text className="text-slate-500 text-[10px] mt-0.5">
+                  GPS data required — waiting for backend connection.
+                </Text>
+              </View>
+            </View>
           ) : (
+            // GPS available but weather not yet fetched (first 30-min window)
             <View className="py-4 items-center">
               <Text className="text-slate-500 text-sm">
-                {weatherError ?? "Fetching weather..."}
+                Fetching weather...
               </Text>
               <Text className="text-slate-600 text-xs mt-1">
                 Requires internet connection on the phone

@@ -263,4 +263,4 @@ class MissionManager:
 
         if bearing < -20:  return "LEFT"
         elif bearing > 20: return "RIGHT"
-        else return "FORWARD"
+        return "FORWARD"
