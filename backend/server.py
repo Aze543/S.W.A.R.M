@@ -37,7 +37,7 @@ TRASH_COLLECTED_COUNT   = 0           # Limit: 30 trash
 BASKET_OPEN_DURATION_S: float = 4.0
 
 # Track whether we already have a pending close scheduled.
-_basket_close_timer: threading.Timer = None
+_basket_close_timer: Optional[threading.Timer] = None
 _basket_lock = threading.Lock()
 
 

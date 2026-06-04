@@ -1,7 +1,7 @@
 import serial
 import threading
 import time
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import logging
 
