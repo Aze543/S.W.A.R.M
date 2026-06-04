@@ -11,7 +11,6 @@ import queue
 import threading
 import requests
 import time
-import random
 from datetime import datetime
 from ultralytics import YOLO
 from flask import Flask, Response, jsonify, render_template_string, request, send_file
@@ -287,6 +286,93 @@ def map_current_trash_location():
 MAX_COUNTED_IDS = 1000
 
 
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def _filter_detections(boxes, ids) -> list[dict]:
+    """Return detection dicts that pass the area gate. CC ≈ 3."""
+    MIN_BOX_AREA, MAX_BOX_AREA = 250, 40_000
+    out = []
+    for box, obj_id in zip(boxes, ids):
+        x1, y1, x2, y2 = box
+        w, h = int(x2 - x1), int(y2 - y1)
+        area = w * h
+        if area < MIN_BOX_AREA:
+            print(f"too small  W:{w} H:{h} A:{area}")
+            continue
+        if area > MAX_BOX_AREA:
+            print(f"too large  W:{w} H:{h} A:{area}")
+            continue
+        out.append({
+            "id": int(obj_id),
+            "cx": int((x1 + x2) / 2),
+            "cy": int((y1 + y2) / 2),
+            "box": box,
+            "width": w,
+            "height": h,
+            "area": area,
+        })
+    return out
+
+
+def _get_trash_position(cx: int) -> tuple[str, str]:
+    """Map target x-coordinate to position string + action label. CC ≈ 3."""
+    if cx < 240:
+        return "LEFT",   "TRASH LEFT - PI CHECKING LIDAR"
+    if cx > 400:
+        return "RIGHT",  "TRASH RIGHT - PI CHECKING LIDAR"
+    return     "CENTER", "TRASH CENTER - PI CHECKING FRONT"
+
+
+def _annotate_detections(
+    annotated,
+    detection_list: list[dict],
+    primary_id: int,
+    basket_opened_ids: set,
+) -> None:
+    """Draw circles, labels, and trigger basket open when applicable. CC ≈ 2."""
+    for item in detection_list:
+        obj_id, cx, cy = item["id"], item["cx"], item["cy"]
+        is_primary = (obj_id == primary_id)
+
+        if is_primary and cy > 320 and obj_id not in basket_opened_ids:
+            basket_opened_ids.add(obj_id)
+            open_basket_on_pi()
+
+        if is_primary:
+            cv2.circle(annotated, (cx, cy), 10, (0, 255, 0), 2)
+            cv2.circle(annotated, (cx, cy),  4, (0, 0, 255), -1)
+            cv2.putText(annotated, "TARGET", (cx - 20, cy - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        else:
+            cv2.circle(annotated, (cx, cy), 4, (0, 0, 255), -1)
+
+        cv2.putText(annotated, f"ID:{obj_id} ({cx},{cy})", (cx + 10, cy - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+
+def _update_cross_line(
+    item: dict,
+    track_history_y: dict,
+    counted_ids: set,
+) -> int:
+    """Update Y-history and return 1 if this item crossed the line. CC ≈ 3."""
+    obj_id, cy = item["id"], item["cy"]
+    if obj_id not in track_history_y:
+        track_history_y[obj_id] = cy
+        return 0
+
+    prev_y = track_history_y[obj_id]
+    track_history_y[obj_id] = cy
+
+    if prev_y < LINE_Y <= cy and obj_id not in counted_ids:
+        counted_ids.add(obj_id)
+        map_current_trash_location()
+        return 1
+    return 0
+
+
+# ── main generator ─────────────────────────────────────────────────────────
+
 def generate_annotated_frames():
     global total_cross_y, track_history_y, counted_ids, basket_opened_ids
     global latest_detections, current_action
@@ -298,185 +384,66 @@ def generate_annotated_frames():
             continue
 
         results = model.track(
-            frame,
-            persist=True,
-            tracker="botsort.yaml",
-            device="cpu",
-            verbose=False,
-            imgsz=320,
+            frame, persist=True, tracker="botsort.yaml",
+            device="cpu", verbose=False, imgsz=320,
         )
-
-        annotated             = results[0].plot()
-        current_frame_detections: list = []
-
+        annotated = results[0].plot()
         cv2.line(annotated, (0, LINE_Y), (frame.shape[1], LINE_Y), (0, 255, 255), 2)
 
-        if results[0].boxes is not None and len(results[0].boxes) > 0:
-            boxes = results[0].boxes.xyxy.cpu().tolist()
-            ids   = (
-                results[0].boxes.id.cpu().tolist()
-                if results[0].boxes.id is not None
-                else list(range(len(boxes)))
-            )
+        has_boxes = results[0].boxes is not None and len(results[0].boxes) > 0
 
-            detection_list = []
-
-            MIN_BOX_AREA = 250
-            MAX_BOX_AREA = 40000
-
-            for box, obj_id in zip(boxes, ids):
-                obj_id = int(obj_id)
-
-                x1, y1, x2, y2 = box
-
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-
-                box_width = int(x2 - x1)
-                box_height = int(y2 - y1)
-                box_area = box_width * box_height
-
-                fits_basket = (
-                    MIN_BOX_AREA <= box_area <= MAX_BOX_AREA
-                )
-
-                if box_area < MIN_BOX_AREA:
-                    print(
-                        f"too small"
-                        f"W:{box_width} H:{box_height} A:{box_area}")
-<<<<<<< HEAD
-                    continue
-
-                if box_area > MAX_BOX_AREA:
-                    print(
-                        f"too large"
-                        f"W:{box_width} H:{box_height} A:{box_area}")
-                    continue
-
-                detection_list.append({
-                    "id": obj_id,
-                    "cx": cx,
-                    "cy": cy,
-                    "box": box,
-                    "width": box_width,
-                    "height": box_height,
-                    "area": box_area
-                })
-
-=======
-                    continue
-                    
-                if box_area > MAX_BOX_AREA:
-                    print(
-                        f"too large"
-                        f"W:{box_width} H:{box_height} A:{box_area}")
-                    continue
-
-                detection_list.append({
-                    "id": obj_id,
-                    "cx": cx,
-                    "cy": cy,
-                    "box": box,
-                    "width": box_width,
-                    "height": box_height,
-                    "area": box_area
-                })
-
->>>>>>> dfd12b68bd416601c4e1fbd69f999267f32cb13f
-            if len(detection_list) == 0:
-                latest_detections = []
-                send_auto_data(False, "CENTER")
-                current_action = "NO COLLECTABLE TRASH"
-                track_history_y.clear()
-                continue
-
-            detection_list.sort(key=lambda item: (-item["cy"], item["cx"]))
-            primary_target = detection_list[0]
-            target_x       = primary_target["cx"]
-
-            if target_x < 240:
-                trash_position  = "LEFT"
-                current_action  = "TRASH LEFT - PI CHECKING LIDAR"
-            elif target_x > 400:
-                trash_position  = "RIGHT"
-                current_action  = "TRASH RIGHT - PI CHECKING LIDAR"
-            else:
-                trash_position  = "CENTER"
-                current_action  = "TRASH CENTER - PI CHECKING FRONT"
-
-            send_auto_data(True, trash_position)
-
-            current_ids = {int(obj_id) for obj_id in ids}
-
-            for item in detection_list:
-                obj_id = item["id"]
-                cx, cy = item["cx"], item["cy"]
-                current_frame_detections.append(f"ID: {obj_id} | X: {cx} | Y: {cy}")
-
-                is_primary = (obj_id == primary_target["id"])
-
-                #Open basket when target is near front of the ASV
-                if is_primary and cy > 320 and obj_id not in basket_opened_ids:
-                    basket_opened_ids.add(obj_id)
-                    open_basket_on_pi()
-
-                if is_primary:
-                    cv2.circle(annotated, (cx, cy), 10, (0, 255, 0), 2)
-                    cv2.circle(annotated, (cx, cy), 4,  (0, 0, 255), -1)
-                    cv2.putText(
-                        annotated, "TARGET",
-                        (cx - 20, cy - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
-                    )
-                else:
-                    cv2.circle(annotated, (cx, cy), 4, (0, 0, 255), -1)
-
-                cv2.putText(
-                    annotated, f"ID:{obj_id} ({cx},{cy})",
-                    (cx + 10, cy - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
-                )
-
-                # Cross-line counter — open basket the moment a new item crosses
-                if obj_id not in track_history_y:
-                    track_history_y[obj_id] = cy
-                else:
-                    prev_y = track_history_y[obj_id]
-                    if prev_y < LINE_Y <= cy and obj_id not in counted_ids:
-                        total_cross_y += 1
-                        counted_ids.add(obj_id)
-                        map_current_trash_location()
-                    track_history_y[obj_id] = cy
-
-            stale_ids = set(track_history_y.keys()) - current_ids
-            for sid in stale_ids:
-                del track_history_y[sid]
-
-            stale_basket_ids = basket_opened_ids - current_ids
-            for sid in stale_basket_ids:
-                basket_opened_ids.remove(sid)
-
-            if len(counted_ids) > MAX_COUNTED_IDS:
-                overflow  = len(counted_ids) - MAX_COUNTED_IDS
-                to_remove = list(counted_ids)[:overflow]
-                counted_ids -= set(to_remove)
-
-            latest_detections = current_frame_detections
-
-        else:
+        if not has_boxes:
             latest_detections = []
             send_auto_data(False, "CENTER")
             current_action = "IDLE: SCANNING AREA"
             track_history_y.clear()
+        else:
+            raw_ids = results[0].boxes.id
+            ids = raw_ids.cpu().tolist() if raw_ids is not None \
+                  else list(range(len(results[0].boxes)))
+            boxes = results[0].boxes.xyxy.cpu().tolist()
 
-        cv2.putText(
-            annotated, f"ACTION: {current_action}",
-            (20, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2,
-        )
-        cv2.putText(
-            annotated, f"Trash Count: {total_cross_y}",
-            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2,
-        )
+            detection_list = _filter_detections(boxes, ids)
+
+            if not detection_list:
+                latest_detections = []
+                send_auto_data(False, "CENTER")
+                current_action = "NO COLLECTABLE TRASH"
+                track_history_y.clear()
+            else:
+                detection_list.sort(key=lambda d: (-d["cy"], d["cx"]))
+                primary = detection_list[0]
+
+                trash_position, current_action = _get_trash_position(primary["cx"])
+                send_auto_data(True, trash_position)
+
+                _annotate_detections(annotated, detection_list,
+                                     primary["id"], basket_opened_ids)
+
+                current_ids = {int(i) for i in ids}
+                latest_detections = []
+
+                for item in detection_list:
+                    latest_detections.append(
+                        f"ID: {item['id']} | X: {item['cx']} | Y: {item['cy']}"
+                    )
+                    total_cross_y += _update_cross_line(
+                        item, track_history_y, counted_ids
+                    )
+
+                # Evict stale tracking state
+                for sid in set(track_history_y) - current_ids:
+                    del track_history_y[sid]
+                basket_opened_ids -= current_ids ^ basket_opened_ids - current_ids
+
+                if len(counted_ids) > MAX_COUNTED_IDS:
+                    overflow = len(counted_ids) - MAX_COUNTED_IDS
+                    counted_ids -= set(list(counted_ids)[:overflow])
+
+        cv2.putText(annotated, f"ACTION: {current_action}",
+                    (20, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.putText(annotated, f"Trash Count: {total_cross_y}",
+                    (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
 
         ret, buffer = cv2.imencode(".jpg", annotated)
         yield (
